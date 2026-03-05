@@ -1,4 +1,4 @@
-# wa-greenapi-ingest-skill (Phase 2+ history fallback)
+# wa-greenapi-ingest-skill (text-first media policy)
 
 Отдельный ingest-проект для импорта WhatsApp событий из **GREEN-API** в SQLite-архив `wa_archive.db`.
 
@@ -13,23 +13,38 @@
   - `history` → `lastOutgoingMessages` + `lastIncomingMessages`
   - `auto` (default) → сначала `queue`, если 0 событий — fallback на `history`
 - нормализует queue/history события в одну схему таблицы `messages`
-- history direction mapping (устойчиво к разным payload-полям):
+- history direction mapping:
   - `lastOutgoingMessages` -> `direction=out`
   - `lastIncomingMessages` -> `direction=in`
-  - приоритет: endpoint hint (`direction_hint`) → поля `direction/type/typeWebhook/eventType/...` → `fromMe=true`
-- помечает источник в `source_type`:
-  - queue: `greenapi`
-  - history: `greenapi-history`
-- дедуплицирует по `source_message_id` (`idMessage`) и уже существующим записям в БД
-- умеет **скачивать media локально** (`data/media/...`)
-- для **voice/audio**:
-  - скачивает media
-  - делает транскрипцию (OpenAI Whisper API → fallback local `whisper`/`whisper-cli`)
-  - сохраняет transcript в `messages.text` (вместо placeholder `<media:audio>`)
-  - пишет диагностику в `raw_json.waArchiveIngestDiag`
-- удаляет queue-уведомление (`deleteNotification`) после обработки (кроме dry-run)
+- дедуплицирует по `source_message_id` (`idMessage`) и fallback-ключу
 
-> Текущий embeddings/pipeline подхватывает transcript автоматически, т.к. он лежит в `messages.text`.
+## Новая политика хранения media (text-first)
+
+По умолчанию бинарные media-файлы **не накапливаются**.
+
+### Image
+- временно скачивает image
+- делает описание содержимого (vision)
+- сохраняет в `messages.text` финальный текст (для поиска/эмбеддингов)
+- удаляет локальный файл при `GREENAPI_KEEP_MEDIA_FILES=0`
+
+### Audio/Voice
+- временно скачивает audio/voice
+- делает транскрипцию (OpenAI Whisper → fallback local `whisper`/`whisper-cli`)
+- сохраняет в `messages.text` финальный текст транскрипта
+- удаляет локальный файл при `GREENAPI_KEEP_MEDIA_FILES=0`
+
+### Остальные media (video/docs/stickers/...)
+- бинарь не сохраняет
+- пишет мета-текст в `messages.text` + диагностику в `raw_json`
+
+### Диагностика в `raw_json`
+В `raw_json.waArchiveIngestDiag` добавляются поля:
+- `textFirstPolicy`
+- `mediaDownload`
+- `mediaStorage` (в т.ч. `binaryDeleted` / `binaryStored` / `pathExistsAfterProcessing`)
+- `transcription` (для audio)
+- `imageDescription` (для image)
 
 ---
 
@@ -56,13 +71,29 @@ cp .env.example .env
 # заполни .env
 ```
 
-Если нужен OpenAI-транскриб:
+Если нужен OpenAI-транскриб/vision:
 
 ```bash
 export OPENAI_API_KEY=...
 ```
 
-(Если ключа нет, скрипт попробует local `whisper`/`whisper-cli`.)
+---
+
+## Ключевые env
+
+```bash
+GREENAPI_KEEP_MEDIA_FILES=0     # default: удалять временные файлы
+GREENAPI_DESCRIBE_IMAGES=1      # default: включено
+GREENAPI_TRANSCRIBE_AUDIO=1     # default: включено
+```
+
+Дополнительно:
+
+```bash
+GREENAPI_DESCRIBE_MODEL=gpt-4o-mini
+GREENAPI_TRANSCRIBE_MODEL=whisper-1
+GREENAPI_TRANSCRIBE_LANGUAGE=
+```
 
 ---
 
@@ -74,111 +105,25 @@ export OPENAI_API_KEY=...
 
 Smoke проверяет:
 - синтаксис Python
-- self-check direction mapping для history payload (`scripts/history_direction_selfcheck.py`)
+- self-check direction mapping (`scripts/history_direction_selfcheck.py`)
 - dry-run ingest 1 события
 - наличие verify-скрипта
 
 ---
 
-## CLI режимы источника (`--source`)
+## Запуск ingest
 
-```bash
---source queue|history|auto
-```
-
-- `queue` — только queue (`receiveNotification`)
-- `history` — только history API:
-  - `GET /waInstance{idInstance}/lastOutgoingMessages/{token}`
-  - `GET /waInstance{idInstance}/lastIncomingMessages/{token}`
-- `auto` (default) — сначала queue, если `received=0`, то history
-
-### History direction mapping и одноразовый repair старых записей
-
-Начиная с текущего фикса:
-- `lastOutgoingMessages` нормализуется в `direction=out`
-- `lastIncomingMessages` нормализуется в `direction=in`
-
-Если в БД уже есть старые записи `greenapi-history` с `direction=in` для outgoing-history (из-за старого бага + дедупа), можно выполнить безопасный одноразовый repair только для очевидных кейсов (`historyDirectionHint='out'`):
-
-```bash
-sqlite3 /home/openclaw/.openclaw/workspace/wa_archive.db "
-UPDATE messages
-SET direction='out'
-WHERE source_type='greenapi-history'
-  AND direction='in'
-  AND json_extract(raw_json, '$.waArchiveIngestDiag.historyDirectionHint')='out';
-"
-```
-
-Проверка перед/после:
-
-```bash
-sqlite3 /home/openclaw/.openclaw/workspace/wa_archive.db "
-SELECT direction,
-       json_extract(raw_json, '$.waArchiveIngestDiag.historyDirectionHint') AS hint,
-       COUNT(*)
-FROM messages
-WHERE source_type='greenapi-history'
-GROUP BY direction, hint
-ORDER BY hint, direction;
-"
-```
-
----
-
-## Тестовый прогон для нашего кейса (text + audio из history)
-
-### 1) Dry-run через history (без записи в БД)
-
-```bash
-set -a && source .env && set +a
-python3 scripts/greenapi_ingest.py ingest-once \
-  --source history \
-  --dry-run \
-  --max-events 20 \
-  --verbose
-```
-
-### 2) Реальный ingest через history (записать text + audio с транскриптом)
-
-```bash
-set -a && source .env && set +a
-python3 scripts/greenapi_ingest.py ingest-once \
-  --source history \
-  --max-events 20 \
-  --verbose
-```
-
-### 3) Проверка, что есть media + transcript
-
-```bash
-./scripts/verify_media_transcript.sh ./wa_archive.db
-```
-
-Скрипт ищет записи `source_type IN ('greenapi','greenapi-history')` и проверяет:
-- media-файл физически существует
-- `waArchiveIngestDiag.transcription.ok=true`
-- `messages.text` уже не `<media:...>` placeholder
-
----
-
-## Авто-режим (default)
+### ingest-once
 
 ```bash
 set -a && source .env && set +a
 python3 scripts/greenapi_ingest.py ingest-once \
   --source auto \
-  --max-events 10 \
+  --max-events 20 \
   --verbose
 ```
 
-Логика:
-- сначала queue
-- если queue пустая (`received=0`) — автоматом берёт history
-
----
-
-## Непрерывный режим
+### run
 
 ```bash
 set -a && source .env && set +a
@@ -189,27 +134,36 @@ python3 scripts/greenapi_ingest.py run \
   --verbose
 ```
 
-`--max-events 0` в `run` = без лимита.
+### Полезные флаги CLI
+
+```bash
+--no-describe-images
+--no-transcribe-audio
+--keep-media-files
+--describe-model gpt-4o-mini
+--transcribe-model whisper-1
+--transcribe-language ru
+--dry-run
+--since <unix-ts|iso|source_message_id>
+```
 
 ---
 
-## Дополнительные флаги
+## Verify text-first
 
 ```bash
---max-events N
---since <unix-ts|iso|source_message_id>
---dry-run
---no-transcribe-audio
---transcribe-model whisper-1
---transcribe-language ru
+./scripts/verify_media_transcript.sh ./wa_archive.db 300 ./data/media
 ```
+
+Проверяет:
+- есть текстовые записи для `image/audio` (без `<media:...>` placeholder)
+- при `GREENAPI_KEEP_MEDIA_FILES=0` нет сохранённых файлов (по DB-диагностике и по фактическим файлам в media-dir)
 
 ---
 
 ## Совместимость с `wa_archive.db`
 
 Пишется в те же поля `messages`:
-
 - `ts`
 - `direction`
 - `peer`

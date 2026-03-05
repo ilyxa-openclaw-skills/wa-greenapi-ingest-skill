@@ -11,6 +11,7 @@ Phase 2 ingest для GREEN-API -> wa_archive.db (таблица messages).
 from __future__ import annotations
 
 import argparse
+import base64
 import datetime as dt
 import hashlib
 import json
@@ -35,12 +36,25 @@ DEFAULT_STATE_PATH = Path(os.getenv("GREENAPI_STATE_PATH", "./.greenapi_ingest_s
 DEFAULT_RECEIVE_TIMEOUT = int(os.getenv("GREENAPI_RECEIVE_TIMEOUT", "5"))
 DEFAULT_POLL_SLEEP = float(os.getenv("GREENAPI_POLL_SLEEP_SEC", "0.5"))
 DEFAULT_MEDIA_DIR = Path(os.getenv("GREENAPI_MEDIA_STORE_DIR", "./data/media"))
+DEFAULT_KEEP_MEDIA_FILES = str(os.getenv("GREENAPI_KEEP_MEDIA_FILES", "0")).strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "y",
+}
+DEFAULT_DESCRIBE_IMAGES = str(os.getenv("GREENAPI_DESCRIBE_IMAGES", "1")).strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "y",
+}
 DEFAULT_TRANSCRIBE_AUDIO = str(os.getenv("GREENAPI_TRANSCRIBE_AUDIO", "1")).strip().lower() in {
     "1",
     "true",
     "yes",
     "y",
 }
+DEFAULT_DESCRIBE_MODEL = str(os.getenv("GREENAPI_DESCRIBE_MODEL", "gpt-4o-mini")).strip() or "gpt-4o-mini"
 DEFAULT_TRANSCRIBE_MODEL = str(os.getenv("GREENAPI_TRANSCRIBE_MODEL", "whisper-1")).strip() or "whisper-1"
 DEFAULT_TRANSCRIBE_LANGUAGE = str(os.getenv("GREENAPI_TRANSCRIBE_LANGUAGE", "")).strip() or None
 DEFAULT_HTTP_TIMEOUT = int(os.getenv("GREENAPI_HTTP_TIMEOUT_SEC", "45"))
@@ -509,14 +523,17 @@ def _extract_text_and_media_flags(payload: dict[str, Any]) -> tuple[str, dict[st
 
     audio_data = md.get("audioMessageData") if isinstance(md.get("audioMessageData"), dict) else {}
     file_data = md.get("fileMessageData") if isinstance(md.get("fileMessageData"), dict) else {}
+    image_data = md.get("imageMessageData") if isinstance(md.get("imageMessageData"), dict) else {}
 
     mime_type = _first_non_empty(
         audio_data.get("mimeType"),
+        image_data.get("mimeType"),
         file_data.get("mimeType"),
         md.get("mimeType"),
     )
     file_name = _first_non_empty(
         audio_data.get("fileName"),
+        image_data.get("fileName"),
         file_data.get("fileName"),
         md.get("fileName"),
     )
@@ -526,6 +543,10 @@ def _extract_text_and_media_flags(payload: dict[str, Any]) -> tuple[str, dict[st
         or "voice" in type_message_lc
         or str(mime_type).lower().startswith("audio/")
     )
+    is_image_like = (
+        "image" in type_message_lc
+        or str(mime_type).lower().startswith("image/")
+    )
 
     is_voice = (
         _is_truthy(audio_data.get("ptt"))
@@ -534,13 +555,27 @@ def _extract_text_and_media_flags(payload: dict[str, Any]) -> tuple[str, dict[st
         or "ptt" in type_message_lc
     )
 
+    media_kind = "media"
+    if type_message_lc.endswith("message"):
+        media_kind = type_message_lc[:-7] or "media"
+    elif type_message_lc:
+        media_kind = type_message_lc
+
+    explicit_text_types = {"textmessage", "extendedtextmessage"}
+    is_media_hint = bool(
+        is_audio_like
+        or is_image_like
+        or (type_message_lc and type_message_lc not in explicit_text_types and type_message_lc != "")
+    )
+
     if text:
         return text, {
             "messageType": type_message or "textMessage",
-            "isMedia": False,
-            "isAudio": False,
-            "isVoice": False,
-            "mediaLabel": "text",
+            "isMedia": bool(is_media_hint),
+            "isAudio": bool(is_audio_like),
+            "isImage": bool(is_image_like),
+            "isVoice": bool(is_voice),
+            "mediaLabel": media_kind if is_media_hint else "text",
             "mimeType": mime_type,
             "fileName": file_name,
         }
@@ -550,22 +585,18 @@ def _extract_text_and_media_flags(payload: dict[str, Any]) -> tuple[str, dict[st
             "messageType": type_message or "audioMessage",
             "isMedia": True,
             "isAudio": True,
+            "isImage": False,
             "isVoice": bool(is_voice),
             "mediaLabel": "voice" if is_voice else "audio",
             "mimeType": mime_type,
             "fileName": file_name,
         }
 
-    media_kind = "media"
-    if type_message_lc.endswith("message"):
-        media_kind = type_message_lc[:-7] or "media"
-    elif type_message_lc:
-        media_kind = type_message_lc
-
     return f"<media:{media_kind}>", {
         "messageType": type_message or "unknown",
         "isMedia": True,
         "isAudio": False,
+        "isImage": bool(is_image_like),
         "isVoice": False,
         "mediaLabel": media_kind,
         "mimeType": mime_type,
@@ -611,7 +642,9 @@ def _extract_media_probe(payload: dict[str, Any], media_meta: dict[str, Any], so
     return {
         "isMedia": bool(media_meta.get("isMedia")),
         "isAudio": bool(media_meta.get("isAudio")),
+        "isImage": bool(media_meta.get("isImage")),
         "isVoice": bool(media_meta.get("isVoice")),
+        "messageType": media_meta.get("messageType") or "",
         "mediaLabel": media_meta.get("mediaLabel") or "media",
         "mimeType": media_meta.get("mimeType") or "",
         "fileName": media_meta.get("fileName") or "",
@@ -931,6 +964,138 @@ def transcribe_with_fallback(path: Path, model: str, language: str | None) -> tu
     except Exception as e:
         errs.append(str(e))
         raise RuntimeError(" | ".join(errs))
+
+
+def _build_media_meta_text(meta: dict[str, Any], suffix: str = "") -> str:
+    label = str(meta.get("mediaLabel") or "media").strip() or "media"
+    message_type = str(meta.get("messageType") or "").strip()
+    mime_type = str(meta.get("mimeType") or "").strip()
+    file_name = str(meta.get("fileName") or "").strip()
+
+    parts = [f"[media:{label}]"]
+    if message_type:
+        parts.append(f"type={message_type}")
+    if mime_type:
+        parts.append(f"mime={mime_type}")
+    if file_name:
+        parts.append(f"file={file_name}")
+    if suffix:
+        parts.append(str(suffix).strip())
+    return " ".join(p for p in parts if p)
+
+
+def _cleanup_downloaded_file(path_raw: str) -> tuple[bool, str]:
+    raw = str(path_raw or "").strip()
+    if not raw:
+        return False, "empty path"
+    p = Path(raw).expanduser()
+    if not p.exists():
+        return False, "already missing"
+    try:
+        p.unlink()
+        return True, "deleted"
+    except Exception as e:
+        return False, f"unlink failed: {e}"
+
+
+def describe_image_openai(path: Path, mime_type: str = "", model: str = DEFAULT_DESCRIBE_MODEL, timeout_sec: int = 240) -> tuple[str, str]:
+    key = os.getenv("OPENAI_API_KEY", "").strip()
+    if not key:
+        raise RuntimeError("OPENAI_API_KEY is not set")
+    if not shutil.which("curl"):
+        raise RuntimeError("curl is not available")
+
+    img_bytes = path.read_bytes()
+    if not img_bytes:
+        raise RuntimeError("image file is empty")
+
+    img_mime = str(mime_type or "").strip().lower()
+    if not img_mime:
+        guessed, _ = mimetypes.guess_type(str(path))
+        img_mime = str(guessed or "image/jpeg")
+
+    b64 = base64.b64encode(img_bytes).decode("ascii")
+    data_uri = f"data:{img_mime};base64,{b64}"
+
+    payload = {
+        "model": model,
+        "temperature": 0,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": (
+                            "Опиши изображение кратко и по фактам для полнотекстового поиска в архиве сообщений. "
+                            "1-2 предложения, без домыслов."
+                        ),
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": data_uri},
+                    },
+                ],
+            }
+        ],
+    }
+
+    cmd = [
+        "curl",
+        "-sS",
+        "--fail-with-body",
+        "https://api.openai.com/v1/chat/completions",
+        "-H",
+        f"Authorization: Bearer {key}",
+        "-H",
+        "Content-Type: application/json",
+        "-d",
+        json.dumps(payload, ensure_ascii=False),
+    ]
+
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_sec)
+    if proc.returncode != 0:
+        err = (proc.stderr or proc.stdout or "").strip()
+        raise RuntimeError(f"OpenAI vision failed: {err[:500]}")
+
+    parsed = _safe_json_loads(proc.stdout or "")
+    if not parsed:
+        raise RuntimeError("OpenAI vision returned invalid JSON")
+
+    choices = parsed.get("choices") if isinstance(parsed, dict) else None
+    if not isinstance(choices, list) or not choices:
+        raise RuntimeError("OpenAI vision returned empty choices")
+
+    msg = choices[0].get("message") if isinstance(choices[0], dict) else None
+    txt = ""
+    if isinstance(msg, dict):
+        txt = str(msg.get("content") or "").strip()
+
+    if not txt:
+        raise RuntimeError("OpenAI vision returned empty text")
+
+    return txt, f"openai-vision:{model}"
+
+
+def describe_image_with_fallback(path: Path, mime_type: str, model: str = DEFAULT_DESCRIBE_MODEL) -> tuple[str, str, list[str]]:
+    errs: list[str] = []
+
+    try:
+        txt, engine = describe_image_openai(path, mime_type=mime_type, model=model)
+        return txt, engine, errs
+    except Exception as e:
+        errs.append(str(e))
+
+    guessed, _ = mimetypes.guess_type(str(path))
+    img_mime = str(mime_type or guessed or "").strip() or "unknown"
+    size = 0
+    try:
+        size = int(path.stat().st_size)
+    except Exception:
+        size = 0
+
+    fallback = f"[image] Описание недоступно (vision недоступен). mime={img_mime} size={size}"
+    return fallback, "fallback:meta", errs
 
 
 def normalize_notification(notification: dict[str, Any], media_url: str) -> dict[str, Any] | None:
@@ -1353,6 +1518,9 @@ def _enrich_media_and_transcript(
     transcribe_audio: bool,
     transcribe_model: str,
     transcribe_language: str | None,
+    describe_images: bool,
+    describe_model: str,
+    keep_media_files: bool,
 ) -> dict[str, Any]:
     meta = row.get("_media_meta") if isinstance(row.get("_media_meta"), dict) else {}
     payload = row.get("_payload") if isinstance(row.get("_payload"), dict) else {}
@@ -1362,6 +1530,8 @@ def _enrich_media_and_transcript(
     result = {
         "media_downloaded": 0,
         "transcribed": 0,
+        "images_described": 0,
+        "media_deleted": 0,
     }
 
     probe = _extract_media_probe(payload, meta, str(row.get("source_message_id") or ""))
@@ -1370,58 +1540,179 @@ def _enrich_media_and_transcript(
         row["raw_json"] = json.dumps(raw_obj, ensure_ascii=False)
         return result
 
-    media_info = download_media_file(client=client, row=row, probe=probe, media_root=media_dir)
-    if media_info:
-        diag["mediaDownload"] = media_info
-    else:
-        diag["mediaDownload"] = {"ok": False, "reason": "download_failed_unknown"}
+    is_audio = _is_truthy(meta.get("isAudio"))
+    is_image = _is_truthy(meta.get("isImage"))
+    needs_download = bool(is_audio or is_image)
 
-    if media_info and media_info.get("ok"):
+    diag["textFirstPolicy"] = {
+        "keepMediaFiles": bool(keep_media_files),
+        "describeImages": bool(describe_images),
+        "transcribeAudio": bool(transcribe_audio),
+    }
+
+    media_info: dict[str, Any] | None = None
+    if needs_download:
+        media_info = download_media_file(client=client, row=row, probe=probe, media_root=media_dir)
+        if media_info:
+            diag["mediaDownload"] = media_info
+        else:
+            diag["mediaDownload"] = {"ok": False, "reason": "download_failed_unknown"}
+    else:
+        diag["mediaDownload"] = {
+            "ok": False,
+            "skipped": True,
+            "reason": "text-first: non-image/non-audio media is not downloaded",
+        }
+
+    if isinstance(media_info, dict) and media_info.get("ok"):
         result["media_downloaded"] = 1
 
-    if (
-        transcribe_audio
-        and _is_truthy(meta.get("isAudio"))
-        and isinstance(media_info, dict)
-        and media_info.get("ok")
-        and media_info.get("path")
-    ):
-        media_path = Path(str(media_info.get("path")))
-        try:
-            transcript, engine, fallback_errors = transcribe_with_fallback(
-                media_path,
-                model=transcribe_model,
-                language=transcribe_language,
-            )
-            transcript = transcript.strip()
-            if transcript:
-                if str(row.get("text") or "").strip().startswith("<media:"):
-                    diag["placeholderText"] = row.get("text")
-                    row["text"] = transcript
-                diag["transcription"] = {
-                    "ok": True,
-                    "engine": engine,
-                    "chars": len(transcript),
-                    "language": transcribe_language,
-                    "fallbackErrors": fallback_errors,
-                }
-                result["transcribed"] = 1
-            else:
+    media_path = Path(str(media_info.get("path"))) if isinstance(media_info, dict) and media_info.get("ok") and media_info.get("path") else None
+
+    if is_audio:
+        if transcribe_audio and media_path is not None:
+            try:
+                transcript, engine, fallback_errors = transcribe_with_fallback(
+                    media_path,
+                    model=transcribe_model,
+                    language=transcribe_language,
+                )
+                transcript = transcript.strip()
+                if transcript:
+                    prev = str(row.get("text") or "").strip()
+                    if prev and not (prev.startswith("<media:") and prev.endswith(">")):
+                        row["text"] = f"{prev}\n[audio transcript] {transcript}"
+                    else:
+                        row["text"] = f"[audio transcript] {transcript}"
+                    diag["transcription"] = {
+                        "ok": True,
+                        "engine": engine,
+                        "chars": len(transcript),
+                        "language": transcribe_language,
+                        "fallbackErrors": fallback_errors,
+                    }
+                    result["transcribed"] = 1
+                else:
+                    diag["transcription"] = {
+                        "ok": False,
+                        "error": "empty transcript",
+                    }
+            except Exception as e:
                 diag["transcription"] = {
                     "ok": False,
-                    "error": "empty transcript",
+                    "error": str(e),
                 }
-        except Exception as e:
+                logging.warning("Transcription failed for %s: %s", row.get("source_message_id"), e)
+        elif transcribe_audio:
             diag["transcription"] = {
                 "ok": False,
-                "error": str(e),
+                "error": "audio media not downloaded",
             }
-            logging.warning("Transcription failed for %s: %s", row.get("source_message_id"), e)
-    elif _is_truthy(meta.get("isAudio")) and transcribe_audio:
-        diag["transcription"] = {
-            "ok": False,
-            "error": "audio media not downloaded",
-        }
+        else:
+            diag["transcription"] = {
+                "ok": False,
+                "skipped": True,
+                "reason": "disabled by flag",
+            }
+
+        current = str(row.get("text") or "").strip()
+        if not current or (current.startswith("<media:") and current.endswith(">")):
+            row["text"] = _build_media_meta_text(meta, suffix="transcript_unavailable")
+
+    if is_image:
+        image_mime = str(meta.get("mimeType") or "").strip()
+        if describe_images and media_path is not None:
+            try:
+                desc, engine, fallback_errors = describe_image_with_fallback(
+                    media_path,
+                    mime_type=image_mime,
+                    model=describe_model,
+                )
+                desc = str(desc or "").strip()
+                if desc:
+                    prev = str(row.get("text") or "").strip()
+                    if prev and not (prev.startswith("<media:") and prev.endswith(">")):
+                        row["text"] = f"{prev}\n[image description] {desc}"
+                    else:
+                        row["text"] = f"[image description] {desc}"
+                    diag["imageDescription"] = {
+                        "ok": True,
+                        "engine": engine,
+                        "chars": len(desc),
+                        "fallbackErrors": fallback_errors,
+                    }
+                    result["images_described"] = 1
+                else:
+                    diag["imageDescription"] = {
+                        "ok": False,
+                        "error": "empty image description",
+                    }
+            except Exception as e:
+                diag["imageDescription"] = {
+                    "ok": False,
+                    "error": str(e),
+                }
+                logging.warning("Image description failed for %s: %s", row.get("source_message_id"), e)
+        elif describe_images:
+            diag["imageDescription"] = {
+                "ok": False,
+                "error": "image media not downloaded",
+            }
+        else:
+            diag["imageDescription"] = {
+                "ok": False,
+                "skipped": True,
+                "reason": "disabled by flag",
+            }
+
+        current = str(row.get("text") or "").strip()
+        if not current or (current.startswith("<media:") and current.endswith(">")):
+            row["text"] = _build_media_meta_text(meta, suffix="description_unavailable")
+
+    if not needs_download:
+        current = str(row.get("text") or "").strip()
+        if not current or (current.startswith("<media:") and current.endswith(">")):
+            row["text"] = _build_media_meta_text(meta, suffix="binary_not_saved")
+
+    storage_meta: dict[str, Any] = {
+        "policy": "text-first",
+        "keepMediaFiles": bool(keep_media_files),
+        "binaryStored": False,
+        "binaryDeleted": False,
+        "binaryPath": "",
+    }
+
+    if media_path is None:
+        storage_meta["note"] = "no_file_downloaded"
+    elif keep_media_files:
+        storage_meta.update(
+            {
+                "binaryStored": True,
+                "binaryDeleted": False,
+                "binaryPath": str(media_path),
+                "pathExistsAfterProcessing": media_path.exists(),
+                "note": "kept_by_policy",
+            }
+        )
+    else:
+        deleted, cleanup_note = _cleanup_downloaded_file(str(media_path))
+        if deleted:
+            result["media_deleted"] = 1
+        storage_meta.update(
+            {
+                "binaryStored": False,
+                "binaryDeleted": bool(deleted),
+                "binaryPath": str(media_path),
+                "cleanup": cleanup_note,
+                "pathExistsAfterProcessing": media_path.exists(),
+                "note": "deleted_after_processing" if deleted else "cleanup_failed",
+            }
+        )
+
+    diag["mediaStorage"] = storage_meta
+
+    if isinstance(diag.get("mediaDownload"), dict) and media_path is not None:
+        diag["mediaDownload"]["pathExistsAfterProcessing"] = media_path.exists()
 
     raw_obj["waArchiveIngestDiag"] = diag
     row["raw_obj"] = raw_obj
@@ -1440,6 +1731,8 @@ def _empty_stats(dry_run: bool) -> dict[str, Any]:
         "errors": 0,
         "media_downloaded": 0,
         "transcribed": 0,
+        "images_described": 0,
+        "media_deleted": 0,
         "dry_run": bool(dry_run),
     }
 
@@ -1455,6 +1748,9 @@ def _process_normalized_row(
     transcribe_audio: bool,
     transcribe_model: str,
     transcribe_language: str | None,
+    describe_images: bool,
+    describe_model: str,
+    keep_media_files: bool,
     since_filter: SinceFilter | None,
 ) -> None:
     if normalized is None:
@@ -1484,9 +1780,14 @@ def _process_normalized_row(
         transcribe_audio=bool(transcribe_audio),
         transcribe_model=transcribe_model,
         transcribe_language=transcribe_language,
+        describe_images=bool(describe_images),
+        describe_model=describe_model,
+        keep_media_files=bool(keep_media_files),
     )
     result["media_downloaded"] += int(enrich.get("media_downloaded") or 0)
     result["transcribed"] += int(enrich.get("transcribed") or 0)
+    result["images_described"] += int(enrich.get("images_described") or 0)
+    result["media_deleted"] += int(enrich.get("media_deleted") or 0)
 
     action = upsert_message(conn, normalized)
     if action == "inserted":
@@ -1507,6 +1808,9 @@ def ingest_queue_once(
     transcribe_audio: bool = True,
     transcribe_model: str = DEFAULT_TRANSCRIBE_MODEL,
     transcribe_language: str | None = DEFAULT_TRANSCRIBE_LANGUAGE,
+    describe_images: bool = True,
+    describe_model: str = DEFAULT_DESCRIBE_MODEL,
+    keep_media_files: bool = DEFAULT_KEEP_MEDIA_FILES,
     since_filter: SinceFilter | None = None,
 ) -> dict[str, Any]:
     state = _load_json(state_path, default={})
@@ -1536,6 +1840,9 @@ def ingest_queue_once(
                 transcribe_audio=transcribe_audio,
                 transcribe_model=transcribe_model,
                 transcribe_language=transcribe_language,
+                describe_images=describe_images,
+                describe_model=describe_model,
+                keep_media_files=keep_media_files,
                 since_filter=since_filter,
             )
         except Exception:
@@ -1574,6 +1881,9 @@ def ingest_history_once(
     transcribe_audio: bool = True,
     transcribe_model: str = DEFAULT_TRANSCRIBE_MODEL,
     transcribe_language: str | None = DEFAULT_TRANSCRIBE_LANGUAGE,
+    describe_images: bool = True,
+    describe_model: str = DEFAULT_DESCRIBE_MODEL,
+    keep_media_files: bool = DEFAULT_KEEP_MEDIA_FILES,
     since_filter: SinceFilter | None = None,
     max_events: int = 50,
 ) -> dict[str, Any]:
@@ -1614,6 +1924,9 @@ def ingest_history_once(
                     transcribe_audio=transcribe_audio,
                     transcribe_model=transcribe_model,
                     transcribe_language=transcribe_language,
+                    describe_images=describe_images,
+                    describe_model=describe_model,
+                    keep_media_files=keep_media_files,
                     since_filter=since_filter,
                 )
             except Exception:
@@ -1649,6 +1962,9 @@ def ingest_once_by_source(
     transcribe_audio: bool,
     transcribe_model: str,
     transcribe_language: str | None,
+    describe_images: bool,
+    describe_model: str,
+    keep_media_files: bool,
     since_filter: SinceFilter | None,
     source: str,
     max_history_events: int,
@@ -1666,6 +1982,9 @@ def ingest_once_by_source(
             transcribe_audio=transcribe_audio,
             transcribe_model=transcribe_model,
             transcribe_language=transcribe_language,
+            describe_images=describe_images,
+            describe_model=describe_model,
+            keep_media_files=keep_media_files,
             since_filter=since_filter,
         )
 
@@ -1679,6 +1998,9 @@ def ingest_once_by_source(
             transcribe_audio=transcribe_audio,
             transcribe_model=transcribe_model,
             transcribe_language=transcribe_language,
+            describe_images=describe_images,
+            describe_model=describe_model,
+            keep_media_files=keep_media_files,
             since_filter=since_filter,
             max_events=max_history_events,
         )
@@ -1693,6 +2015,9 @@ def ingest_once_by_source(
         transcribe_audio=transcribe_audio,
         transcribe_model=transcribe_model,
         transcribe_language=transcribe_language,
+        describe_images=describe_images,
+        describe_model=describe_model,
+        keep_media_files=keep_media_files,
         since_filter=since_filter,
     )
 
@@ -1708,6 +2033,9 @@ def ingest_once_by_source(
         transcribe_audio=transcribe_audio,
         transcribe_model=transcribe_model,
         transcribe_language=transcribe_language,
+        describe_images=describe_images,
+        describe_model=describe_model,
+        keep_media_files=keep_media_files,
         since_filter=since_filter,
         max_events=max_history_events,
     )
@@ -1732,6 +2060,9 @@ def ingest_batch(
     transcribe_audio: bool,
     transcribe_model: str,
     transcribe_language: str | None,
+    describe_images: bool,
+    describe_model: str,
+    keep_media_files: bool,
     since_filter: SinceFilter | None,
     max_events: int,
     source: str = SOURCE_AUTO,
@@ -1751,6 +2082,9 @@ def ingest_batch(
             transcribe_audio=transcribe_audio,
             transcribe_model=transcribe_model,
             transcribe_language=transcribe_language,
+            describe_images=describe_images,
+            describe_model=describe_model,
+            keep_media_files=keep_media_files,
             since_filter=since_filter,
             max_events=n,
         )
@@ -1766,6 +2100,9 @@ def ingest_batch(
             transcribe_audio=transcribe_audio,
             transcribe_model=transcribe_model,
             transcribe_language=transcribe_language,
+            describe_images=describe_images,
+            describe_model=describe_model,
+            keep_media_files=keep_media_files,
             since_filter=since_filter,
         )
         _merge_stats(agg, stats)
@@ -1784,6 +2121,9 @@ def ingest_batch(
             transcribe_audio=transcribe_audio,
             transcribe_model=transcribe_model,
             transcribe_language=transcribe_language,
+            describe_images=describe_images,
+            describe_model=describe_model,
+            keep_media_files=keep_media_files,
             since_filter=since_filter,
             max_events=n,
         )
@@ -1806,6 +2146,9 @@ def run_loop(
     transcribe_audio: bool,
     transcribe_model: str,
     transcribe_language: str | None,
+    describe_images: bool,
+    describe_model: str,
+    keep_media_files: bool,
     since_filter: SinceFilter | None,
     source: str = SOURCE_AUTO,
 ) -> None:
@@ -1835,6 +2178,9 @@ def run_loop(
                     transcribe_audio=transcribe_audio,
                     transcribe_model=transcribe_model,
                     transcribe_language=transcribe_language,
+                    describe_images=describe_images,
+                    describe_model=describe_model,
+                    keep_media_files=keep_media_files,
                     since_filter=since_filter,
                 )
             elif source_mode == SOURCE_HISTORY:
@@ -1847,6 +2193,9 @@ def run_loop(
                     transcribe_audio=transcribe_audio,
                     transcribe_model=transcribe_model,
                     transcribe_language=transcribe_language,
+                    describe_images=describe_images,
+                    describe_model=describe_model,
+                    keep_media_files=keep_media_files,
                     since_filter=since_filter,
                     max_events=history_limit,
                 )
@@ -1861,6 +2210,9 @@ def run_loop(
                     transcribe_audio=transcribe_audio,
                     transcribe_model=transcribe_model,
                     transcribe_language=transcribe_language,
+                    describe_images=describe_images,
+                    describe_model=describe_model,
+                    keep_media_files=keep_media_files,
                     since_filter=since_filter,
                 )
                 if int(queue_stats.get("received") or 0) > 0:
@@ -1876,6 +2228,9 @@ def run_loop(
                         transcribe_audio=transcribe_audio,
                         transcribe_model=transcribe_model,
                         transcribe_language=transcribe_language,
+                        describe_images=describe_images,
+                        describe_model=describe_model,
+                        keep_media_files=keep_media_files,
                         since_filter=since_filter,
                         max_events=history_limit,
                     )
@@ -1938,7 +2293,7 @@ def main() -> None:
     common.add_argument(
         "--dry-run",
         action="store_true",
-        help="Только read/normalize: не писать в БД, не скачивать media, не делать transcript, не deleteNotification",
+        help="Только read/normalize: не писать в БД, не скачивать media, не делать transcript/description, не deleteNotification",
     )
     common.add_argument(
         "--max-events",
@@ -1959,7 +2314,10 @@ def main() -> None:
         help="Best-effort фильтр: unix-ts/ISO timestamp или source_message_id (queue-order gate)",
     )
     common.add_argument("--no-transcribe-audio", action="store_true", help="Отключить авто-транскрипт voice/audio")
+    common.add_argument("--no-describe-images", action="store_true", help="Отключить авто-описание изображений")
+    common.add_argument("--keep-media-files", action="store_true", help="Не удалять временно скачанные image/audio файлы")
     common.add_argument("--transcribe-model", default=DEFAULT_TRANSCRIBE_MODEL, help="OpenAI model (default whisper-1)")
+    common.add_argument("--describe-model", default=DEFAULT_DESCRIBE_MODEL, help="Vision model for image description (default gpt-4o-mini)")
     common.add_argument("--transcribe-language", default=DEFAULT_TRANSCRIBE_LANGUAGE, help="Опциональный язык (ru/en/...) ")
     common.add_argument("--verbose", action="store_true", help="Подробные логи")
 
@@ -1979,8 +2337,12 @@ def main() -> None:
         logging.info("Since filter enabled: %s", since_filter.describe())
 
     transcribe_audio = bool(DEFAULT_TRANSCRIBE_AUDIO) and not bool(args.no_transcribe_audio)
+    describe_images = bool(DEFAULT_DESCRIBE_IMAGES) and not bool(args.no_describe_images)
+    keep_media_files = bool(DEFAULT_KEEP_MEDIA_FILES) or bool(args.keep_media_files)
+
     if args.dry_run:
         transcribe_audio = False
+        describe_images = False
 
     if args.cmd == "ingest-once":
         stats = ingest_batch(
@@ -1993,6 +2355,9 @@ def main() -> None:
             transcribe_audio=transcribe_audio,
             transcribe_model=str(args.transcribe_model or "whisper-1"),
             transcribe_language=str(args.transcribe_language or "").strip() or None,
+            describe_images=describe_images,
+            describe_model=str(args.describe_model or DEFAULT_DESCRIBE_MODEL),
+            keep_media_files=keep_media_files,
             since_filter=since_filter,
             max_events=max(1, int(args.max_events if args.max_events is not None else 1)),
             source=str(args.source or SOURCE_AUTO).strip().lower(),
@@ -2014,6 +2379,9 @@ def main() -> None:
             transcribe_audio=transcribe_audio,
             transcribe_model=str(args.transcribe_model or "whisper-1"),
             transcribe_language=str(args.transcribe_language or "").strip() or None,
+            describe_images=describe_images,
+            describe_model=str(args.describe_model or DEFAULT_DESCRIBE_MODEL),
+            keep_media_files=keep_media_files,
             since_filter=since_filter,
             source=str(args.source or SOURCE_AUTO).strip().lower(),
         )
