@@ -38,10 +38,13 @@ echo "[smoke] minitest: image route selection (path priority + degraded image_ur
 python3 "$ROOT_DIR/scripts/minitest_image_route_selection.py"
 
 echo "[smoke] minitest: audio transcription path (default model + fallback chain)"
-python3 "$ROOT_DIR/scripts/minitest_audio_transcription_path.py"
+GREENAPI_TRANSCRIBE_MODEL=gpt-4o-mini-transcribe python3 "$ROOT_DIR/scripts/minitest_audio_transcription_path.py"
 
 echo "[smoke] minitest: content policy (PDF<=20 full, PDF>20 skip, text full)"
 python3 "$ROOT_DIR/scripts/minitest_content_policy.py"
+
+echo "[smoke] minitest: office extraction (DOCX/XLSX, tables, heuristic, diagnostics)"
+python3 "$ROOT_DIR/scripts/minitest_office_extraction.py"
 
 echo "[smoke] Пробный прием 1 уведомления в dry-run (без записи в БД / media / transcript и без deleteNotification)"
 python3 "$INGEST_SCRIPT" ingest-once --dry-run --max-events 1 --verbose

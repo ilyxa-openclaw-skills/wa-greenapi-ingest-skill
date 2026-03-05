@@ -49,8 +49,14 @@
 
 ### 4) Office (doc/docx/xls/xlsx)
 
-- если текст извлекается — сохраняется целиком
-- если не извлекается — ставится fail marker (`[office extraction failed]`) без мусорного fallback
+Улучшен office extraction pipeline:
+
+- **DOCX**: надёжный ZIP/XML parse (`document + header* + footer* + footnotes/endnotes/comments`, включая текст из таблиц)
+- **XLSX**: извлечение по листам с нормализацией `sharedStrings`, `inlineStr`, формул и значений (`A1: ...`, `B3: =... => ...`)
+- авто-детект формата по ZIP-сигнатуре (даже если файл локально сохранён с неправильным расширением, например `.bin`)
+- fallback в локальные CLI-инструменты только если они реально доступны в системе
+- устойчивость к битым XML/архивам + частичным ошибкам
+- эвристика: если извлечено достаточно текста (`GREENAPI_OFFICE_MIN_CHARS`, default 24), fail-marker не ставится
 
 ### 5) Audio transcription quality (RU-friendly default)
 
@@ -80,6 +86,7 @@ GREENAPI_TRANSCRIBE_MODEL=whisper-1
 - `transcription` (audio)
 - `imageDescription` (image)
 - `documentAnalysis` (pdf/text/office)
+  - для office всегда пишутся диагностические поля: `engine`, `bytes`, `error`, `extracted_chars`
 - `contentAnalysis` (унифицированная диагностика image/doc backend)
 
 ## Ключевые env
@@ -101,6 +108,7 @@ OPENCLAW_GATEWAY_TOKEN=
 GREENAPI_PDF_MAX_PAGES=20
 GREENAPI_TEXT_ANALYZE_MAX_BYTES=8388608
 GREENAPI_TEXT_ANALYZE_MAX_CHARS=2000000
+GREENAPI_OFFICE_MIN_CHARS=24
 ```
 
 ## Smoke / minitest
@@ -117,6 +125,7 @@ GREENAPI_TEXT_ANALYZE_MAX_CHARS=2000000
 - `python3 scripts/minitest_image_route_selection.py`
 - `python3 scripts/minitest_audio_transcription_path.py`
 - `python3 scripts/minitest_content_policy.py`
+- `python3 scripts/minitest_office_extraction.py`
 - dry-run ingest-once
 
 ## Отдельные тесты новой политики
@@ -125,6 +134,7 @@ GREENAPI_TEXT_ANALYZE_MAX_CHARS=2000000
 python3 scripts/minitest_image_route_selection.py
 python3 scripts/minitest_audio_transcription_path.py
 python3 scripts/minitest_content_policy.py
+python3 scripts/minitest_office_extraction.py
 ```
 
 Проверяет:
@@ -135,6 +145,7 @@ python3 scripts/minitest_content_policy.py
 - PDF <=20 страниц: full processed
 - PDF >20 страниц: skipped (`too_many_pages`) + `pending_reprocess/manual=true`
 - text file: full analyzed
+- office DOCX/XLSX: table/sharedStrings/formula extraction + heuristic no-fail при достаточном тексте
 - keep=0 cleanup временных файлов
 
 ## Запуск ingest

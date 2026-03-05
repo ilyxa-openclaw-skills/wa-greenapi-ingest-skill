@@ -79,6 +79,7 @@ OPENAI_TRANSCRIBE_FALLBACK_MODEL = "whisper-1"
 DEFAULT_TRANSCRIBE_LANGUAGE = str(os.getenv("GREENAPI_TRANSCRIBE_LANGUAGE", "")).strip() or None
 DEFAULT_TEXT_ANALYZE_MAX_BYTES = int(os.getenv("GREENAPI_TEXT_ANALYZE_MAX_BYTES", str(8 * 1024 * 1024)))
 DEFAULT_TEXT_ANALYZE_MAX_CHARS = int(os.getenv("GREENAPI_TEXT_ANALYZE_MAX_CHARS", "2000000"))
+DEFAULT_OFFICE_MIN_CHARS = int(os.getenv("GREENAPI_OFFICE_MIN_CHARS", "24"))
 DEFAULT_PDF_MAX_PAGES = int(os.getenv("GREENAPI_PDF_MAX_PAGES", "20"))
 DEFAULT_HTTP_TIMEOUT = int(os.getenv("GREENAPI_HTTP_TIMEOUT_SEC", "45"))
 
@@ -2077,72 +2078,470 @@ def _read_text_file_full(
     }
 
 
-def _extract_xml_text(raw: bytes) -> str:
+def _xml_parse_robust(raw: bytes) -> ET.Element | None:
+    if not raw:
+        return None
+
     try:
-        root = ET.fromstring(raw)
+        return ET.fromstring(raw)
     except Exception:
+        pass
+
+    decoded = raw.decode("utf-8", errors="replace")
+    decoded = re.sub(r"[\x00-\x08\x0B\x0C\x0E-\x1F]", "", decoded)
+    try:
+        return ET.fromstring(decoded)
+    except Exception:
+        return None
+
+
+def _extract_xml_text(raw: bytes) -> str:
+    root = _xml_parse_robust(raw)
+    if root is None:
         return ""
-    chunks = [str(x).strip() for x in root.itertext() if str(x or "").strip()]
+
+    chunks: list[str] = []
+    for part in root.itertext():
+        normalized = re.sub(r"\s+", " ", str(part or "")).strip()
+        if normalized:
+            chunks.append(normalized)
     return "\n".join(chunks)
 
 
-def _extract_docx_text(path: Path) -> str:
+def _zip_names_set(zf: zipfile.ZipFile) -> set[str]:
+    return set(zf.namelist())
+
+
+def _docx_parts_for_parse(names: set[str]) -> list[str]:
+    out: list[str] = []
+
+    if "word/document.xml" in names:
+        out.append("word/document.xml")
+
+    for prefix in ("word/header", "word/footer"):
+        for name in sorted(x for x in names if x.startswith(prefix) and x.endswith(".xml")):
+            out.append(name)
+
+    for name in ("word/footnotes.xml", "word/endnotes.xml", "word/comments.xml"):
+        if name in names:
+            out.append(name)
+
+    # Иногда полезный текст бывает в glossary/текст-боксах.
+    for name in sorted(x for x in names if x.startswith("word/glossary/") and x.endswith(".xml")):
+        out.append(name)
+
+    # unique с сохранением порядка
+    uniq: list[str] = []
+    seen: set[str] = set()
+    for name in out:
+        if name not in seen:
+            seen.add(name)
+            uniq.append(name)
+    return uniq
+
+
+def _extract_docx_text(path: Path) -> dict[str, Any]:
     chunks: list[str] = []
-    with zipfile.ZipFile(path, "r") as zf:
-        for name in ("word/document.xml", "word/footnotes.xml", "word/endnotes.xml"):
-            if name not in zf.namelist():
-                continue
-            raw = zf.read(name)
-            txt = _extract_xml_text(raw)
-            if txt:
-                chunks.append(txt)
-    return "\n\n".join(chunks).strip()
+    errors: list[str] = []
+    used_bytes = 0
+
+    try:
+        with zipfile.ZipFile(path, "r") as zf:
+            names = _zip_names_set(zf)
+            parts = _docx_parts_for_parse(names)
+
+            if not parts:
+                errors.append("docx xml parts not found")
+
+            for part_name in parts:
+                try:
+                    raw = zf.read(part_name)
+                    used_bytes += len(raw)
+                except Exception as e:
+                    errors.append(f"{part_name}: read failed: {e}")
+                    continue
+
+                text_part = _extract_xml_text(raw)
+                if text_part:
+                    chunks.append(f"[{part_name}]\n{text_part}")
+                else:
+                    errors.append(f"{part_name}: empty or unparsable xml")
+    except zipfile.BadZipFile as e:
+        raise RuntimeError(f"docx bad zip: {e}")
+
+    return {
+        "text": "\n\n".join(chunks).strip(),
+        "engine": "zip-xml:docx-v2",
+        "errors": errors,
+        "bytes": int(used_bytes),
+    }
 
 
-def _extract_xlsx_text(path: Path) -> str:
+def _xlsx_shared_string_value(si_elem: ET.Element) -> str:
+    ns = {"x": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+    text_nodes = si_elem.findall(".//x:t", ns)
+    if text_nodes:
+        return "".join(str(n.text or "") for n in text_nodes).strip()
+    return _extract_xml_text(ET.tostring(si_elem, encoding="utf-8")).strip()
+
+
+def _xlsx_parse_shared_strings(zf: zipfile.ZipFile) -> tuple[list[str], int, list[str]]:
+    name = "xl/sharedStrings.xml"
+    if name not in _zip_names_set(zf):
+        return [], 0, []
+
+    errors: list[str] = []
+    try:
+        raw = zf.read(name)
+    except Exception as e:
+        return [], 0, [f"{name}: read failed: {e}"]
+
+    root = _xml_parse_robust(raw)
+    if root is None:
+        return [], len(raw), [f"{name}: parse failed"]
+
+    ns = {"x": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+    strings: list[str] = []
+    for si in root.findall(".//x:si", ns):
+        strings.append(_xlsx_shared_string_value(si))
+
+    return strings, len(raw), errors
+
+
+def _resolve_zip_target(base_dir: str, target: str) -> str:
+    t = str(target or "").strip().replace("\\", "/")
+    if not t:
+        return ""
+    if t.startswith("/"):
+        return t.lstrip("/")
+    return str((Path(base_dir) / t).as_posix())
+
+
+def _xlsx_sheet_entries(zf: zipfile.ZipFile) -> tuple[list[tuple[str, str]], int, list[str]]:
+    names = _zip_names_set(zf)
+    used_bytes = 0
+    errors: list[str] = []
+    out: list[tuple[str, str]] = []
+
+    workbook_name = "xl/workbook.xml"
+    rels_name = "xl/_rels/workbook.xml.rels"
+
+    if workbook_name in names:
+        wb_raw = zf.read(workbook_name)
+        used_bytes += len(wb_raw)
+        wb_root = _xml_parse_robust(wb_raw)
+
+        rel_map: dict[str, str] = {}
+        if rels_name in names:
+            rel_raw = zf.read(rels_name)
+            used_bytes += len(rel_raw)
+            rel_root = _xml_parse_robust(rel_raw)
+            if rel_root is not None:
+                rel_ns = {"r": "http://schemas.openxmlformats.org/package/2006/relationships"}
+                for rel in rel_root.findall(".//r:Relationship", rel_ns):
+                    rel_id = str(rel.attrib.get("Id") or "").strip()
+                    rel_target = str(rel.attrib.get("Target") or "").strip()
+                    if rel_id and rel_target:
+                        rel_map[rel_id] = _resolve_zip_target("xl", rel_target)
+            else:
+                errors.append(f"{rels_name}: parse failed")
+
+        if wb_root is not None:
+            ns = {
+                "x": "http://schemas.openxmlformats.org/spreadsheetml/2006/main",
+                "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
+            }
+            rel_key = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id"
+            for sheet in wb_root.findall(".//x:sheets/x:sheet", ns):
+                sheet_name = str(sheet.attrib.get("name") or "").strip() or "Sheet"
+                rid = str(sheet.attrib.get(rel_key) or "").strip()
+                target = rel_map.get(rid, "")
+                if target and target in names:
+                    out.append((sheet_name, target))
+                elif target:
+                    errors.append(f"sheet={sheet_name}: target not found ({target})")
+        else:
+            errors.append(f"{workbook_name}: parse failed")
+
+    if out:
+        return out, used_bytes, errors
+
+    # fallback: просто все worksheet xml
+    sheet_names = sorted(x for x in names if x.startswith("xl/worksheets/") and x.endswith(".xml"))
+    for sheet_path in sheet_names:
+        out.append((Path(sheet_path).stem, sheet_path))
+
+    if not out:
+        errors.append("xlsx worksheet xml parts not found")
+
+    return out, used_bytes, errors
+
+
+def _xlsx_value_from_cell(cell: ET.Element, shared_strings: list[str]) -> tuple[str, str]:
+    ns = {"x": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+
+    formula = str(cell.findtext("x:f", default="", namespaces=ns) or "").strip()
+    cell_type = str(cell.attrib.get("t") or "").strip().lower()
+    raw_v = str(cell.findtext("x:v", default="", namespaces=ns) or "").strip()
+
+    value = ""
+    if cell_type == "s":
+        if raw_v.lstrip("+-").isdigit():
+            idx = int(raw_v)
+            if 0 <= idx < len(shared_strings):
+                value = str(shared_strings[idx] or "").strip()
+            else:
+                value = raw_v
+        else:
+            value = raw_v
+    elif cell_type == "inlineStr":
+        inline_node = cell.find("x:is", ns)
+        if inline_node is not None:
+            value = _extract_xml_text(ET.tostring(inline_node, encoding="utf-8")).strip()
+    elif cell_type == "b":
+        if raw_v == "1":
+            value = "TRUE"
+        elif raw_v == "0":
+            value = "FALSE"
+        else:
+            value = raw_v
+    elif cell_type == "e":
+        value = f"#ERROR:{raw_v}" if raw_v else "#ERROR"
+    else:
+        value = raw_v
+
+    formula = formula.lstrip("=")
+    return value, formula
+
+
+def _xlsx_sheet_to_text(sheet_name: str, raw: bytes, shared_strings: list[str]) -> tuple[str, str | None]:
+    root = _xml_parse_robust(raw)
+    if root is None:
+        return "", f"{sheet_name}: parse failed"
+
+    ns = {"x": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+    rows: list[str] = []
+
+    for row in root.findall(".//x:sheetData/x:row", ns):
+        cells: list[str] = []
+        for cell in row.findall("x:c", ns):
+            cell_ref = str(cell.attrib.get("r") or "").strip() or "cell"
+            value, formula = _xlsx_value_from_cell(cell, shared_strings)
+            value = str(value or "").strip()
+            formula = str(formula or "").strip()
+
+            if formula and value:
+                cells.append(f"{cell_ref}: ={formula} => {value}")
+            elif formula:
+                cells.append(f"{cell_ref}: ={formula}")
+            elif value:
+                cells.append(f"{cell_ref}: {value}")
+
+        if cells:
+            rows.append(" | ".join(cells))
+
+    if not rows:
+        # fallback: хотя бы общий text dump XML
+        fallback_text = _extract_xml_text(raw)
+        if fallback_text:
+            rows.append(fallback_text)
+
+    text = "\n".join(rows).strip()
+    if not text:
+        return "", f"{sheet_name}: empty sheet text"
+
+    return text, None
+
+
+def _extract_xlsx_text(path: Path) -> dict[str, Any]:
     chunks: list[str] = []
-    with zipfile.ZipFile(path, "r") as zf:
-        for name in sorted(zf.namelist()):
-            if not name.endswith(".xml"):
-                continue
-            if not (name.startswith("xl/") or name.startswith("docProps/")):
-                continue
-            raw = zf.read(name)
-            txt = _extract_xml_text(raw)
-            if txt:
-                chunks.append(txt)
-    return "\n\n".join(chunks).strip()
+    errors: list[str] = []
+    used_bytes = 0
+
+    try:
+        with zipfile.ZipFile(path, "r") as zf:
+            shared_strings, shared_bytes, shared_errs = _xlsx_parse_shared_strings(zf)
+            used_bytes += int(shared_bytes)
+            errors.extend(shared_errs)
+
+            sheet_entries, sheet_meta_bytes, sheet_entry_errs = _xlsx_sheet_entries(zf)
+            used_bytes += int(sheet_meta_bytes)
+            errors.extend(sheet_entry_errs)
+
+            for sheet_name, sheet_path in sheet_entries:
+                try:
+                    raw = zf.read(sheet_path)
+                    used_bytes += len(raw)
+                except Exception as e:
+                    errors.append(f"{sheet_path}: read failed: {e}")
+                    continue
+
+                sheet_text, sheet_err = _xlsx_sheet_to_text(sheet_name, raw, shared_strings)
+                if sheet_text:
+                    chunks.append(f"[sheet:{sheet_name}]\n{sheet_text}")
+                if sheet_err:
+                    errors.append(sheet_err)
+    except zipfile.BadZipFile as e:
+        raise RuntimeError(f"xlsx bad zip: {e}")
+
+    return {
+        "text": "\n\n".join(chunks).strip(),
+        "engine": "zip-xml:xlsx-v2",
+        "errors": errors,
+        "bytes": int(used_bytes),
+    }
 
 
-def _extract_office_text(path: Path) -> tuple[str, str]:
+def _run_cli_text_extractor(cmd: list[str], timeout_sec: int = 120) -> tuple[str, str, str] | None:
+    if not cmd:
+        return None
+    bin_name = str(cmd[0] or "").strip()
+    if not bin_name or not shutil.which(bin_name):
+        return None
+
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, errors="replace", timeout=timeout_sec)
+    except Exception as e:
+        return None
+
+    if proc.returncode != 0:
+        return None
+
+    txt = str(proc.stdout or "").strip()
+    if not txt:
+        return None
+
+    return txt, f"cli:{bin_name}", ""
+
+
+def _office_cli_fallback_cmds(fmt: str, path: Path) -> list[list[str]]:
+    if fmt == ".doc":
+        return [["antiword", str(path)], ["catdoc", str(path)]]
+    if fmt == ".xls":
+        return [["xls2csv", str(path)]]
+    if fmt == ".docx":
+        return [["pandoc", "-f", "docx", "-t", "plain", str(path)]]
+    if fmt == ".xlsx":
+        return [["xlsx2csv", str(path)]]
+    return []
+
+
+def _detect_office_format(path: Path) -> str:
     ext = _extension_from_name(path.name)
+    if ext in OFFICE_EXTENSIONS:
+        return ext
 
-    if ext == ".docx":
-        return _extract_docx_text(path), "zip-xml:docx"
-    if ext == ".xlsx":
-        return _extract_xlsx_text(path), "zip-xml:xlsx"
+    try:
+        if not zipfile.is_zipfile(path):
+            return ext
+    except Exception:
+        return ext
 
-    if ext == ".doc":
-        for cmd in (["antiword", str(path)], ["catdoc", str(path)]):
-            if not shutil.which(cmd[0]):
+    try:
+        with zipfile.ZipFile(path, "r") as zf:
+            names = _zip_names_set(zf)
+            if "word/document.xml" in names:
+                return ".docx"
+            if "xl/workbook.xml" in names:
+                return ".xlsx"
+    except Exception:
+        pass
+
+    return ext
+
+
+def _extract_office_text(path: Path, *, min_chars: int = DEFAULT_OFFICE_MIN_CHARS) -> dict[str, Any]:
+    file_size = int(path.stat().st_size) if path.exists() else 0
+    fmt = _detect_office_format(path)
+
+    errors: list[str] = []
+    engines_tried: list[str] = []
+    extracted_text = ""
+    chosen_engine = ""
+    used_bytes = 0
+
+    primary: dict[str, Any] | None = None
+    if fmt == ".docx":
+        try:
+            primary = _extract_docx_text(path)
+        except Exception as e:
+            errors.append(str(e))
+    elif fmt == ".xlsx":
+        try:
+            primary = _extract_xlsx_text(path)
+        except Exception as e:
+            errors.append(str(e))
+    elif fmt == ".doc":
+        for cmd in _office_cli_fallback_cmds(fmt, path):
+            cli_res = _run_cli_text_extractor(cmd)
+            if cli_res:
+                extracted_text, chosen_engine, _ = cli_res
+                engines_tried.append(chosen_engine)
+                break
+        if not extracted_text:
+            errors.append("legacy .doc text extractor is unavailable")
+    elif fmt == ".xls":
+        for cmd in _office_cli_fallback_cmds(fmt, path):
+            cli_res = _run_cli_text_extractor(cmd)
+            if cli_res:
+                extracted_text, chosen_engine, _ = cli_res
+                engines_tried.append(chosen_engine)
+                break
+        if not extracted_text:
+            errors.append("legacy .xls text extractor is unavailable")
+    else:
+        errors.append(f"unsupported office format: {fmt or 'unknown'}")
+
+    if primary is not None:
+        extracted_text = str(primary.get("text") or "").strip()
+        chosen_engine = str(primary.get("engine") or "").strip()
+        if chosen_engine:
+            engines_tried.append(chosen_engine)
+        used_bytes = int(primary.get("bytes") or 0)
+        for e in primary.get("errors") or []:
+            e_s = str(e or "").strip()
+            if e_s:
+                errors.append(e_s)
+
+    extracted_chars = len(extracted_text)
+    enough_chars = extracted_chars >= max(1, int(min_chars))
+    has_text = bool(extracted_text)
+    heuristic_applied = bool(has_text and enough_chars and errors)
+
+    # Если zip-парсер дал мало текста или ошибки, пробуем локальный CLI fallback (если доступен).
+    if fmt in {".docx", ".xlsx"} and (not has_text or not enough_chars):
+        for cmd in _office_cli_fallback_cmds(fmt, path):
+            cli_res = _run_cli_text_extractor(cmd)
+            if not cli_res:
                 continue
-            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-            if proc.returncode == 0:
-                txt = str(proc.stdout or "").strip()
-                if txt:
-                    return txt, f"cli:{cmd[0]}"
-        raise RuntimeError("legacy .doc text extractor is unavailable")
+            cli_text, cli_engine, _ = cli_res
+            engines_tried.append(cli_engine)
+            if len(cli_text) > len(extracted_text):
+                extracted_text = cli_text
+                chosen_engine = cli_engine
+            break
 
-    if ext == ".xls":
-        if shutil.which("xls2csv"):
-            proc = subprocess.run(["xls2csv", str(path)], capture_output=True, text=True, timeout=120)
-            if proc.returncode == 0:
-                txt = str(proc.stdout or "").strip()
-                if txt:
-                    return txt, "cli:xls2csv"
-        raise RuntimeError("legacy .xls text extractor is unavailable")
+        extracted_chars = len(extracted_text)
+        enough_chars = extracted_chars >= max(1, int(min_chars))
+        has_text = bool(extracted_text)
+        heuristic_applied = bool(has_text and enough_chars and errors)
 
-    raise RuntimeError(f"unsupported office extension: {ext or 'unknown'}")
+    ok = bool(has_text and (not errors or enough_chars or str(chosen_engine).startswith("cli:")))
+
+    return {
+        "ok": ok,
+        "text": extracted_text,
+        "engine": chosen_engine,
+        "format": fmt,
+        "bytes": file_size,
+        "usedBytes": used_bytes,
+        "errors": errors,
+        "error": " | ".join(errors),
+        "extractedChars": extracted_chars,
+        "minCharsThreshold": int(max(1, int(min_chars))),
+        "heuristicApplied": heuristic_applied,
+        "enginesTried": engines_tried,
+    }
 
 
 def _count_pdf_pages(path: Path) -> int | None:
@@ -2215,6 +2614,7 @@ def _enrich_media_and_transcript(
         "openclawGatewayUrl": DEFAULT_OPENCLAW_GATEWAY_URL,
         "textAnalyzeMaxBytes": int(DEFAULT_TEXT_ANALYZE_MAX_BYTES),
         "textAnalyzeMaxChars": int(DEFAULT_TEXT_ANALYZE_MAX_CHARS),
+        "officeMinChars": int(DEFAULT_OFFICE_MIN_CHARS),
         "pdfMaxPages": int(DEFAULT_PDF_MAX_PAGES),
     }
 
@@ -2446,34 +2846,70 @@ def _enrich_media_and_transcript(
             diag["documentAnalysis"] = {
                 "ok": False,
                 "kind": "office",
+                "engine": "",
+                "bytes": 0,
                 "error": "office media not downloaded",
+                "extracted_chars": 0,
                 "pending_reprocess": True,
                 "manual": True,
             }
             _set_document_failed_text(row, "[office extraction failed]")
         else:
             try:
-                extracted_text, extractor = _extract_office_text(media_path)
-                extracted_text = str(extracted_text or "").strip()
+                office = _extract_office_text(media_path, min_chars=DEFAULT_OFFICE_MIN_CHARS)
+                extracted_text = str(office.get("text") or "").strip()
                 extracted_text, chars_truncated = _trim_text_to_limit(extracted_text, DEFAULT_TEXT_ANALYZE_MAX_CHARS)
-                if not extracted_text:
-                    raise RuntimeError("empty office extraction")
-                row["text"] = extracted_text
-                diag["documentAnalysis"] = {
-                    "ok": True,
-                    "kind": "office",
-                    "engine": extractor,
-                    "chars": len(extracted_text),
-                    "charsTruncated": bool(chars_truncated),
-                    "pending_reprocess": bool(chars_truncated),
-                }
-                result["docs_analyzed"] = 1
+
+                extracted_chars = len(extracted_text)
+                heuristic_ok = extracted_chars >= max(1, int(DEFAULT_OFFICE_MIN_CHARS))
+                extraction_ok = bool(extracted_text) and (bool(office.get("ok")) or heuristic_ok)
+
+                if extraction_ok:
+                    row["text"] = extracted_text
+                    diag["documentAnalysis"] = {
+                        "ok": True,
+                        "kind": "office",
+                        "engine": str(office.get("engine") or ""),
+                        "format": str(office.get("format") or ""),
+                        "bytes": int(office.get("bytes") or 0),
+                        "usedBytes": int(office.get("usedBytes") or 0),
+                        "error": str(office.get("error") or ""),
+                        "errors": office.get("errors") or [],
+                        "enginesTried": office.get("enginesTried") or [],
+                        "extracted_chars": extracted_chars,
+                        "charsTruncated": bool(chars_truncated),
+                        "heuristicApplied": bool(office.get("heuristicApplied") or (heuristic_ok and bool(office.get("error")))),
+                        "minCharsThreshold": int(office.get("minCharsThreshold") or DEFAULT_OFFICE_MIN_CHARS),
+                        "pending_reprocess": bool(chars_truncated or office.get("error")),
+                    }
+                    result["docs_analyzed"] = 1
+                else:
+                    diag["documentAnalysis"] = {
+                        "ok": False,
+                        "kind": "office",
+                        "status": "fail",
+                        "engine": str(office.get("engine") or ""),
+                        "format": str(office.get("format") or ""),
+                        "bytes": int(office.get("bytes") or 0),
+                        "usedBytes": int(office.get("usedBytes") or 0),
+                        "error": str(office.get("error") or "empty office extraction"),
+                        "errors": office.get("errors") or [],
+                        "enginesTried": office.get("enginesTried") or [],
+                        "extracted_chars": extracted_chars,
+                        "minCharsThreshold": int(office.get("minCharsThreshold") or DEFAULT_OFFICE_MIN_CHARS),
+                        "pending_reprocess": True,
+                        "manual": True,
+                    }
+                    _set_document_failed_text(row, "[office extraction failed]")
             except Exception as e:
                 diag["documentAnalysis"] = {
                     "ok": False,
                     "kind": "office",
-                    "error": str(e),
                     "status": "fail",
+                    "engine": "",
+                    "bytes": int(media_path.stat().st_size) if media_path.exists() else 0,
+                    "error": str(e),
+                    "extracted_chars": 0,
                     "pending_reprocess": True,
                     "manual": True,
                 }
