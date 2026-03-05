@@ -11,11 +11,18 @@
 
 ## Политика анализа контента (обновлено)
 
-### 1) Единый backend image/doc анализа
+### 1) Единый backend image/doc анализа + image stability fix
 
 Приоритет backend: **OpenClaw gateway** (`GREENAPI_CONTENT_ANALYZE_BACKEND=auto|openclaw|openai`).
 
-Промпт анализа для image/doc теперь строго двухблочный:
+Для **WhatsApp image** внутри OpenClaw backend теперь действует route policy:
+
+- первичный маршрут: **path-анализ** через gateway (локальный файл)
+- `image_url` используется как вспомогательный fallback
+- если `image_url` вернул деградированный/служебный ответ (например `вложение недоступно` / `текст не обнаружен`), выполняется обязательный retry через `path`
+- эвристика выбора лучшего результата: **path > image_url** при конфликте валидных ответов
+
+Промпт анализа для image/doc строго двухблочный:
 
 1. **БЛОК 1 — SUMMARY** (кратко, факты)
 2. **БЛОК 2 — VISIBLE_TEXT** (максимально полный видимый текст, дословно, с маркером `[неразборчиво]`)
@@ -45,7 +52,21 @@
 - если текст извлекается — сохраняется целиком
 - если не извлекается — ставится fail marker (`[office extraction failed]`) без мусорного fallback
 
-### 5) Бинарники media не храним (по умолчанию)
+### 5) Audio transcription quality (RU-friendly default)
+
+По умолчанию используется более сильная модель:
+
+- `GREENAPI_TRANSCRIBE_MODEL=gpt-4o-mini-transcribe`
+- fallback цепочка: `<GREENAPI_TRANSCRIBE_MODEL> -> whisper-1 -> local whisper`
+
+Как переключить модель:
+
+```bash
+GREENAPI_TRANSCRIBE_MODEL=whisper-1
+# или любая доступная в окружении OpenAI transcribe-модель
+```
+
+### 6) Бинарники media не храним (по умолчанию)
 
 `GREENAPI_KEEP_MEDIA_FILES=0` → временно скачанный файл удаляется после обработки.
 
@@ -67,6 +88,8 @@
 GREENAPI_KEEP_MEDIA_FILES=0
 GREENAPI_DESCRIBE_IMAGES=1
 GREENAPI_TRANSCRIBE_AUDIO=1
+GREENAPI_TRANSCRIBE_MODEL=gpt-4o-mini-transcribe
+# fallback: -> whisper-1 -> local whisper
 
 GREENAPI_CONTENT_ANALYZE_BACKEND=auto   # auto|openclaw|openai
 GREENAPI_IMAGE_DESCRIBE_BACKEND=auto    # legacy fallback var
@@ -91,17 +114,24 @@ GREENAPI_TEXT_ANALYZE_MAX_CHARS=2000000
 - `python3 -m py_compile scripts/greenapi_ingest.py`
 - `python3 scripts/history_direction_selfcheck.py`
 - `python3 scripts/minitest_openclaw_image_backend.py`
+- `python3 scripts/minitest_image_route_selection.py`
+- `python3 scripts/minitest_audio_transcription_path.py`
 - `python3 scripts/minitest_content_policy.py`
 - dry-run ingest-once
 
 ## Отдельные тесты новой политики
 
 ```bash
+python3 scripts/minitest_image_route_selection.py
+python3 scripts/minitest_audio_transcription_path.py
 python3 scripts/minitest_content_policy.py
 ```
 
 Проверяет:
 
+- image route: path-first + retry path при деградированном `image_url`
+- конфликт результатов: приоритет `path > image_url`
+- audio: default `gpt-4o-mini-transcribe` + fallback `whisper-1` + local whisper
 - PDF <=20 страниц: full processed
 - PDF >20 страниц: skipped (`too_many_pages`) + `pending_reprocess/manual=true`
 - text file: full analyzed
@@ -123,4 +153,19 @@ python3 scripts/greenapi_ingest.py run --source auto --poll-sleep 0.5 --max-even
 
 ```bash
 ./scripts/verify_media_transcript.sh ./wa_archive.db 300 ./data/media
+```
+
+## Быстрый ручной прогон (1 image + 1 voice)
+
+```bash
+set -a && source .env && set +a
+
+# 1) пришли в WhatsApp одно изображение (или дождись его в queue), затем:
+python3 scripts/greenapi_ingest.py ingest-once --source queue --max-events 1 --verbose
+
+# 2) пришли одно voice/audio сообщение, затем:
+python3 scripts/greenapi_ingest.py ingest-once --source queue --max-events 1 --verbose
+
+# Проверка, что тексты появились и keep=0 cleanup соблюдается:
+./scripts/verify_media_transcript.sh ./wa_archive.db 100 ./data/media
 ```

@@ -71,7 +71,11 @@ DEFAULT_OPENCLAW_GATEWAY_TOKEN = str(os.getenv("OPENCLAW_GATEWAY_TOKEN", "")).st
 DEFAULT_OPENCLAW_DESCRIBE_TIMEOUT = int(
     os.getenv("OPENCLAW_CONTENT_ANALYZE_TIMEOUT_SEC", os.getenv("OPENCLAW_IMAGE_DESCRIBE_TIMEOUT_SEC", "120"))
 )
-DEFAULT_TRANSCRIBE_MODEL = str(os.getenv("GREENAPI_TRANSCRIBE_MODEL", "whisper-1")).strip() or "whisper-1"
+DEFAULT_TRANSCRIBE_MODEL = (
+    str(os.getenv("GREENAPI_TRANSCRIBE_MODEL", "gpt-4o-mini-transcribe")).strip()
+    or "gpt-4o-mini-transcribe"
+)
+OPENAI_TRANSCRIBE_FALLBACK_MODEL = "whisper-1"
 DEFAULT_TRANSCRIBE_LANGUAGE = str(os.getenv("GREENAPI_TRANSCRIBE_LANGUAGE", "")).strip() or None
 DEFAULT_TEXT_ANALYZE_MAX_BYTES = int(os.getenv("GREENAPI_TEXT_ANALYZE_MAX_BYTES", str(8 * 1024 * 1024)))
 DEFAULT_TEXT_ANALYZE_MAX_CHARS = int(os.getenv("GREENAPI_TEXT_ANALYZE_MAX_CHARS", "2000000"))
@@ -922,7 +926,12 @@ def download_media_file(
     }
 
 
-def transcribe_openai(path: Path, model: str = "whisper-1", language: str | None = None, timeout_sec: int = 240) -> tuple[str, str]:
+def transcribe_openai(
+    path: Path,
+    model: str = DEFAULT_TRANSCRIBE_MODEL,
+    language: str | None = None,
+    timeout_sec: int = 240,
+) -> tuple[str, str]:
     key = os.getenv("OPENAI_API_KEY", "").strip()
     if not key:
         raise RuntimeError("OPENAI_API_KEY is not set")
@@ -1018,13 +1027,46 @@ def transcribe_local_whisper(path: Path, language: str | None = None, timeout_se
     raise RuntimeError("no local whisper executable found")
 
 
+def _build_openai_transcribe_model_chain(primary_model: str) -> list[str]:
+    models: list[str] = []
+
+    def add(model_name: str) -> None:
+        candidate = str(model_name or "").strip()
+        if not candidate:
+            return
+        if candidate not in models:
+            models.append(candidate)
+
+    add(primary_model)
+    add(OPENAI_TRANSCRIBE_FALLBACK_MODEL)
+    return models
+
+
+def _is_retryable_openai_transcribe_error(err_text: str) -> bool:
+    s = str(err_text or "").strip().lower()
+    if not s:
+        return True
+    non_retryable_markers = (
+        "openai_api_key is not set",
+        "curl is not available",
+        "unauthorized",
+        "invalid api key",
+    )
+    return not any(marker in s for marker in non_retryable_markers)
+
+
 def transcribe_with_fallback(path: Path, model: str, language: str | None) -> tuple[str, str, list[str]]:
     errs: list[str] = []
-    try:
-        txt, engine = transcribe_openai(path, model=model, language=language)
-        return txt, engine, errs
-    except Exception as e:
-        errs.append(str(e))
+
+    for openai_model in _build_openai_transcribe_model_chain(model):
+        try:
+            txt, engine = transcribe_openai(path, model=openai_model, language=language)
+            return txt, engine, errs
+        except Exception as e:
+            err_text = str(e)
+            errs.append(f"openai:{openai_model}: {err_text}")
+            if not _is_retryable_openai_transcribe_error(err_text):
+                break
 
     try:
         txt, engine = transcribe_local_whisper(path, language=language)
@@ -1097,15 +1139,102 @@ def _looks_like_image_not_seen_response(text: str) -> bool:
         "не могу увидеть изображ",
         "не могу просмотреть изображ",
         "изображение не",
+        "вложение недоступно",
+        "вложение не доступно",
         "can't see",
         "cannot see",
         "cannot view",
+        "attachment unavailable",
+        "attachment is unavailable",
         "no image",
         "image not provided",
         "image was not provided",
         "send the image",
     )
     return any(m in s for m in markers)
+
+
+def _looks_like_degraded_image_analysis_response(text: str, *, route: str = "") -> bool:
+    s = str(text or "").strip().lower()
+    if not s:
+        return True
+
+    if _looks_like_image_not_seen_response(s):
+        return True
+
+    degraded_markers = (
+        "не удалось обработать изображение",
+        "ошибка анализа изображения",
+        "failed to analyze image",
+        "unable to analyze image",
+    )
+    if any(m in s for m in degraded_markers):
+        return True
+
+    # Для image_url это частый деградированный ответ при доступном локальном файле.
+    if str(route or "").strip().lower() == "image_url":
+        if "[текст не обнаружен]" in s or "текст не обнаружен" in s:
+            return True
+
+    return False
+
+
+def _has_two_block_analysis_shape(text: str) -> bool:
+    s = str(text or "").strip().lower()
+    return "summary" in s and "visible_text" in s
+
+
+def _build_image_analysis_candidate(
+    *,
+    text: str,
+    engine: str,
+    route: str,
+) -> dict[str, Any]:
+    normalized = str(text or "").strip()
+    return {
+        "text": normalized,
+        "engine": str(engine or "").strip(),
+        "route": str(route or "").strip() or "unknown",
+        "degraded": _looks_like_degraded_image_analysis_response(normalized, route=route),
+        "hasTwoBlocks": _has_two_block_analysis_shape(normalized),
+        "length": len(normalized),
+    }
+
+
+def _select_best_image_analysis_candidate(
+    path_candidate: dict[str, Any] | None,
+    image_url_candidate: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    if path_candidate and image_url_candidate:
+        path_degraded = bool(path_candidate.get("degraded"))
+        image_url_degraded = bool(image_url_candidate.get("degraded"))
+
+        if path_degraded and not image_url_degraded:
+            return image_url_candidate
+        if image_url_degraded and not path_degraded:
+            return path_candidate
+
+        path_text = str(path_candidate.get("text") or "").strip()
+        image_url_text = str(image_url_candidate.get("text") or "").strip()
+
+        # При конфликте валидных ответов всегда предпочитаем path.
+        if path_text and image_url_text and path_text != image_url_text:
+            return path_candidate
+
+        path_two_blocks = bool(path_candidate.get("hasTwoBlocks"))
+        image_url_two_blocks = bool(image_url_candidate.get("hasTwoBlocks"))
+        if path_two_blocks and not image_url_two_blocks:
+            return path_candidate
+        if image_url_two_blocks and not path_two_blocks:
+            return image_url_candidate
+
+        if int(path_candidate.get("length") or 0) >= int(image_url_candidate.get("length") or 0):
+            return path_candidate
+        return image_url_candidate
+
+    if path_candidate:
+        return path_candidate
+    return image_url_candidate
 
 
 def _gateway_auth_candidates(password: str | None = None, token: str | None = None) -> list[tuple[str, str]]:
@@ -1251,6 +1380,10 @@ def describe_image_via_openclaw(
     prompt_common = _build_content_analysis_prompt("image")
     attempts: list[str] = []
 
+    path_candidate: dict[str, Any] | None = None
+    image_url_candidate: dict[str, Any] | None = None
+    path_attempts = 0
+
     payload_image_url = {
         "model": "openclaw",
         "temperature": 0,
@@ -1265,30 +1398,56 @@ def describe_image_via_openclaw(
         ],
     }
 
+    def try_path(reason: str) -> None:
+        nonlocal path_candidate, path_attempts
+        path_attempts += 1
+        try:
+            txt, engine = _analyze_file_via_openclaw_path(
+                path,
+                mime_type=img_mime,
+                kind="image",
+                gateway_url=gateway_url,
+                timeout_sec=timeout_sec,
+            )
+            path_candidate = _build_image_analysis_candidate(
+                text=txt,
+                engine=engine,
+                route="path",
+            )
+            if bool(path_candidate.get("degraded")):
+                attempts.append(f"{reason}: path returned degraded response")
+        except Exception as e:
+            attempts.append(f"{reason}: path attempt failed: {e}")
+
+    # WhatsApp image policy: приоритет path-анализа через OpenClaw gateway.
+    try_path("primary")
+
+    if path_candidate and not bool(path_candidate.get("degraded")):
+        return str(path_candidate.get("text") or ""), str(path_candidate.get("engine") or "")
+
     try:
         txt, auth_mode = _openclaw_chat_completions_text(
             payload_image_url,
             gateway_url=gateway_url,
             timeout_sec=timeout_sec,
         )
-        if not _looks_like_image_not_seen_response(txt):
-            return txt, f"openclaw-gateway:chat-completions:image_url:{auth_mode}"
-        attempts.append("image_url content was accepted but image seems ignored")
+        image_url_candidate = _build_image_analysis_candidate(
+            text=txt,
+            engine=f"openclaw-gateway:chat-completions:image_url:{auth_mode}",
+            route="image_url",
+        )
     except Exception as e:
         attempts.append(f"image_url attempt failed: {e}")
 
-    try:
-        txt, engine = _analyze_file_via_openclaw_path(
-            path,
-            mime_type=img_mime,
-            kind="image",
-            gateway_url=gateway_url,
-            timeout_sec=timeout_sec,
-        )
-        return txt, engine
-    except Exception as e:
-        attempts.append(f"path adapter failed: {e}")
-        raise RuntimeError(" | ".join(attempts))
+    # Если image_url ответ деградированный при непустом файле — обязательный retry через path.
+    if image_url_candidate and bool(image_url_candidate.get("degraded")) and img_bytes:
+        try_path("retry-after-image_url-degraded")
+
+    chosen = _select_best_image_analysis_candidate(path_candidate, image_url_candidate)
+    if chosen:
+        return str(chosen.get("text") or ""), str(chosen.get("engine") or "")
+
+    raise RuntimeError(" | ".join(attempts) if attempts else "image analysis failed")
 
 
 def analyze_document_via_openclaw(
@@ -2050,6 +2209,8 @@ def _enrich_media_and_transcript(
         "keepMediaFiles": bool(keep_media_files),
         "describeImages": bool(describe_images),
         "transcribeAudio": bool(transcribe_audio),
+        "transcribeModel": str(transcribe_model or DEFAULT_TRANSCRIBE_MODEL),
+        "transcribeOpenAiFallbackModel": OPENAI_TRANSCRIBE_FALLBACK_MODEL,
         "contentAnalyzeBackend": _normalize_image_describe_backend(DEFAULT_CONTENT_ANALYZE_BACKEND),
         "openclawGatewayUrl": DEFAULT_OPENCLAW_GATEWAY_URL,
         "textAnalyzeMaxBytes": int(DEFAULT_TEXT_ANALYZE_MAX_BYTES),
@@ -2969,7 +3130,14 @@ def main() -> None:
     common.add_argument("--no-transcribe-audio", action="store_true", help="Отключить авто-транскрипт voice/audio")
     common.add_argument("--no-describe-images", action="store_true", help="Отключить авто-описание изображений")
     common.add_argument("--keep-media-files", action="store_true", help="Не удалять временно скачанные image/audio файлы")
-    common.add_argument("--transcribe-model", default=DEFAULT_TRANSCRIBE_MODEL, help="OpenAI model (default whisper-1)")
+    common.add_argument(
+        "--transcribe-model",
+        default=DEFAULT_TRANSCRIBE_MODEL,
+        help=(
+            "OpenAI transcription model "
+            f"(default {DEFAULT_TRANSCRIBE_MODEL}; fallback {OPENAI_TRANSCRIBE_FALLBACK_MODEL} -> local whisper)"
+        ),
+    )
     common.add_argument("--describe-model", default=DEFAULT_DESCRIBE_MODEL, help="Vision model for image description (default gpt-4o-mini)")
     common.add_argument("--transcribe-language", default=DEFAULT_TRANSCRIBE_LANGUAGE, help="Опциональный язык (ru/en/...) ")
     common.add_argument("--verbose", action="store_true", help="Подробные логи")
@@ -3006,7 +3174,7 @@ def main() -> None:
             media_dir=args.media_dir,
             dry_run=bool(args.dry_run),
             transcribe_audio=transcribe_audio,
-            transcribe_model=str(args.transcribe_model or "whisper-1"),
+            transcribe_model=str(args.transcribe_model or DEFAULT_TRANSCRIBE_MODEL),
             transcribe_language=str(args.transcribe_language or "").strip() or None,
             describe_images=describe_images,
             describe_model=str(args.describe_model or DEFAULT_DESCRIBE_MODEL),
@@ -3030,7 +3198,7 @@ def main() -> None:
             max_iterations=int(args.max_iterations),
             max_events=max(0, int(args.max_events if args.max_events is not None else 0)),
             transcribe_audio=transcribe_audio,
-            transcribe_model=str(args.transcribe_model or "whisper-1"),
+            transcribe_model=str(args.transcribe_model or DEFAULT_TRANSCRIBE_MODEL),
             transcribe_language=str(args.transcribe_language or "").strip() or None,
             describe_images=describe_images,
             describe_model=str(args.describe_model or DEFAULT_DESCRIBE_MODEL),

@@ -34,6 +34,12 @@ python3 "$ROOT_DIR/scripts/history_direction_selfcheck.py"
 echo "[smoke] minitest: image describe success/failure + no meta fallback + cleanup keep=0"
 python3 "$ROOT_DIR/scripts/minitest_openclaw_image_backend.py"
 
+echo "[smoke] minitest: image route selection (path priority + degraded image_url retry path)"
+python3 "$ROOT_DIR/scripts/minitest_image_route_selection.py"
+
+echo "[smoke] minitest: audio transcription path (default model + fallback chain)"
+python3 "$ROOT_DIR/scripts/minitest_audio_transcription_path.py"
+
 echo "[smoke] minitest: content policy (PDF<=20 full, PDF>20 skip, text full)"
 python3 "$ROOT_DIR/scripts/minitest_content_policy.py"
 
