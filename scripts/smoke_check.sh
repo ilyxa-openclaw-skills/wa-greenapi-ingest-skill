@@ -46,6 +46,9 @@ python3 "$ROOT_DIR/scripts/minitest_content_policy.py"
 echo "[smoke] minitest: office extraction (DOCX/XLSX, tables, heuristic, diagnostics)"
 python3 "$ROOT_DIR/scripts/minitest_office_extraction.py"
 
+echo "[smoke] minitest: legacy .xls fallback via OpenClaw gateway"
+python3 "$ROOT_DIR/scripts/minitest_xls_fallback.py"
+
 echo "[smoke] Пробный прием 1 уведомления в dry-run (без записи в БД / media / transcript и без deleteNotification)"
 python3 "$INGEST_SCRIPT" ingest-once --dry-run --max-events 1 --verbose
 

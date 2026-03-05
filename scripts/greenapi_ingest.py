@@ -2861,8 +2861,17 @@ def _enrich_media_and_transcript(
                 extracted_text, chars_truncated = _trim_text_to_limit(extracted_text, DEFAULT_TEXT_ANALYZE_MAX_CHARS)
 
                 extracted_chars = len(extracted_text)
+                office_format = str(office.get("format") or "").strip().lower()
                 heuristic_ok = extracted_chars >= max(1, int(DEFAULT_OFFICE_MIN_CHARS))
                 extraction_ok = bool(extracted_text) and (bool(office.get("ok")) or heuristic_ok)
+
+                office_errors = [str(x or "").strip() for x in (office.get("errors") or []) if str(x or "").strip()]
+                local_xls_extractor_missing = any(
+                    "legacy .xls text extractor is unavailable" in err.lower() for err in office_errors
+                )
+                should_try_xls_gateway_fallback = bool(
+                    office_format == ".xls" and (not extracted_text or local_xls_extractor_missing)
+                )
 
                 if extraction_ok:
                     row["text"] = extracted_text
@@ -2870,7 +2879,7 @@ def _enrich_media_and_transcript(
                         "ok": True,
                         "kind": "office",
                         "engine": str(office.get("engine") or ""),
-                        "format": str(office.get("format") or ""),
+                        "format": office_format,
                         "bytes": int(office.get("bytes") or 0),
                         "usedBytes": int(office.get("usedBytes") or 0),
                         "error": str(office.get("error") or ""),
@@ -2883,13 +2892,71 @@ def _enrich_media_and_transcript(
                         "pending_reprocess": bool(chars_truncated or office.get("error")),
                     }
                     result["docs_analyzed"] = 1
+                elif should_try_xls_gateway_fallback:
+                    try:
+                        fallback_text, fallback_engine = analyze_document_via_openclaw(
+                            media_path,
+                            mime_type=str(meta.get("mimeType") or "application/vnd.ms-excel"),
+                            kind="office",
+                        )
+                        fallback_text = str(fallback_text or "").strip()
+                        fallback_text, fallback_chars_truncated = _trim_text_to_limit(
+                            fallback_text,
+                            DEFAULT_TEXT_ANALYZE_MAX_CHARS,
+                        )
+                        if not fallback_text:
+                            raise RuntimeError("OpenClaw .xls fallback returned empty text")
+
+                        row["text"] = fallback_text
+                        diag["office_fallback"] = "openclaw_vision"
+                        diag["documentAnalysis"] = {
+                            "ok": True,
+                            "kind": "office",
+                            "engine": str(fallback_engine or ""),
+                            "format": office_format,
+                            "bytes": int(office.get("bytes") or 0),
+                            "usedBytes": int(office.get("usedBytes") or 0),
+                            "error": str(office.get("error") or ""),
+                            "errors": office.get("errors") or [],
+                            "enginesTried": office.get("enginesTried") or [],
+                            "extracted_chars": len(fallback_text),
+                            "charsTruncated": bool(fallback_chars_truncated),
+                            "heuristicApplied": bool(office.get("heuristicApplied")),
+                            "minCharsThreshold": int(office.get("minCharsThreshold") or DEFAULT_OFFICE_MIN_CHARS),
+                            "pending_reprocess": bool(fallback_chars_truncated),
+                            "office_fallback": "openclaw_vision",
+                            "localExtractionOk": bool(office.get("ok")),
+                            "localExtractionError": str(office.get("error") or ""),
+                            "localExtractionChars": extracted_chars,
+                        }
+                        result["docs_analyzed"] = 1
+                    except Exception as e:
+                        diag["documentAnalysis"] = {
+                            "ok": False,
+                            "kind": "office",
+                            "status": "fail",
+                            "engine": str(office.get("engine") or ""),
+                            "format": office_format,
+                            "bytes": int(office.get("bytes") or 0),
+                            "usedBytes": int(office.get("usedBytes") or 0),
+                            "error": str(office.get("error") or "empty office extraction"),
+                            "errors": office.get("errors") or [],
+                            "enginesTried": office.get("enginesTried") or [],
+                            "extracted_chars": extracted_chars,
+                            "minCharsThreshold": int(office.get("minCharsThreshold") or DEFAULT_OFFICE_MIN_CHARS),
+                            "pending_reprocess": True,
+                            "manual": True,
+                            "office_fallback": "openclaw_vision",
+                            "office_fallback_error": str(e),
+                        }
+                        _set_document_failed_text(row, "[office extraction failed]")
                 else:
                     diag["documentAnalysis"] = {
                         "ok": False,
                         "kind": "office",
                         "status": "fail",
                         "engine": str(office.get("engine") or ""),
-                        "format": str(office.get("format") or ""),
+                        "format": office_format,
                         "bytes": int(office.get("bytes") or 0),
                         "usedBytes": int(office.get("usedBytes") or 0),
                         "error": str(office.get("error") or "empty office extraction"),

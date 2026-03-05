@@ -53,6 +53,7 @@
 
 - **DOCX**: надёжный ZIP/XML parse (`document + header* + footer* + footnotes/endnotes/comments`, включая текст из таблиц)
 - **XLSX**: извлечение по листам с нормализацией `sharedStrings`, `inlineStr`, формул и значений (`A1: ...`, `B3: =... => ...`)
+- legacy **XLS**: если локальный extractor недоступен или вернул пустой текст, включается fallback через **OpenClaw gateway document analysis** (тот же 2-блочный SUMMARY + VISIBLE_TEXT)
 - авто-детект формата по ZIP-сигнатуре (даже если файл локально сохранён с неправильным расширением, например `.bin`)
 - fallback в локальные CLI-инструменты только если они реально доступны в системе
 - устойчивость к битым XML/архивам + частичным ошибкам
@@ -87,6 +88,7 @@ GREENAPI_TRANSCRIBE_MODEL=whisper-1
 - `imageDescription` (image)
 - `documentAnalysis` (pdf/text/office)
   - для office всегда пишутся диагностические поля: `engine`, `bytes`, `error`, `extracted_chars`
+  - для legacy `.xls` fallback: `office_fallback=openclaw_vision`
 - `contentAnalysis` (унифицированная диагностика image/doc backend)
 
 ## Ключевые env
@@ -126,6 +128,7 @@ GREENAPI_OFFICE_MIN_CHARS=24
 - `python3 scripts/minitest_audio_transcription_path.py`
 - `python3 scripts/minitest_content_policy.py`
 - `python3 scripts/minitest_office_extraction.py`
+- `python3 scripts/minitest_xls_fallback.py`
 - dry-run ingest-once
 
 ## Отдельные тесты новой политики
@@ -135,6 +138,7 @@ python3 scripts/minitest_image_route_selection.py
 python3 scripts/minitest_audio_transcription_path.py
 python3 scripts/minitest_content_policy.py
 python3 scripts/minitest_office_extraction.py
+python3 scripts/minitest_xls_fallback.py
 ```
 
 Проверяет:
@@ -146,6 +150,7 @@ python3 scripts/minitest_office_extraction.py
 - PDF >20 страниц: skipped (`too_many_pages`) + `pending_reprocess/manual=true`
 - text file: full analyzed
 - office DOCX/XLSX: table/sharedStrings/formula extraction + heuristic no-fail при достаточном тексте
+- legacy XLS: local-fail/empty -> OpenClaw fallback (`office_fallback=openclaw_vision`), fail-marker только если fallback тоже упал
 - keep=0 cleanup временных файлов
 
 ## Запуск ingest
