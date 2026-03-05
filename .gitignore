@@ -8,6 +8,8 @@
 *.log
 .greenapi_ingest_state.json
 
+data/
+
 # python
 __pycache__/
 *.pyc

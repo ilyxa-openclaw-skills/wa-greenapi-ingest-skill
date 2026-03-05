@@ -28,7 +28,10 @@ fi
 echo "[smoke] Python синтаксис"
 python3 -m py_compile "$INGEST_SCRIPT"
 
-echo "[smoke] Пробный прием 1 уведомления в dry-run (без записи в БД и без deleteNotification)"
-python3 "$INGEST_SCRIPT" ingest-once --dry-run --verbose
+echo "[smoke] Пробный прием 1 уведомления в dry-run (без записи в БД / media / transcript и без deleteNotification)"
+python3 "$INGEST_SCRIPT" ingest-once --dry-run --max-events 1 --verbose
+
+echo "[smoke] verify script presence"
+[[ -x "$ROOT_DIR/scripts/verify_media_transcript.sh" ]]
 
 echo "[smoke] OK"

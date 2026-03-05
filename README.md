@@ -1,23 +1,30 @@
-# wa-greenapi-ingest-skill (MVP)
+# wa-greenapi-ingest-skill (Phase 2 test-run)
 
-Отдельный проект для ingest уведомлений из **GREEN-API** в SQLite-архив `wa_archive.db`.
+Отдельный ingest-проект для уведомлений из **GREEN-API** в SQLite-архив `wa_archive.db`.
 
-Цель: убрать рассинхрон с основным fork'ом и вести ingest как изолированный репозиторий.
-
-## Что делает MVP
+## Что делает Phase 2
 
 - читает переменные окружения:
   - `GREENAPI_API_URL`
   - `GREENAPI_MEDIA_URL`
   - `GREENAPI_INSTANCE_TOKEN`
-- забирает уведомление из очереди GREEN-API (`receiveNotification`)
-- нормализует событие сообщения в формат `messages` (совместимый с текущим `wa_archive.db`)
-- поддерживает:
-  - обычный текст
-  - media placeholders (`<media:...>`)
-  - voice/audio marker (для совместимости voice-пайплайна используется `<media:audio>` + флаг `isVoice` в `raw_json`)
-- удаляет уведомление из очереди (`deleteNotification`) после обработки
-- устойчив к ошибкам: логирует и продолжает работу
+- принимает уведомления из queue (`receiveNotification`)
+- нормализует message-события в таблицу `messages`
+- умеет **скачивать media локально** в `data/media/...`
+- для **voice/audio**:
+  - определяет audio/voice media
+  - делает транскрипцию (приоритет: OpenAI Whisper API → fallback local whisper/whisper-cli)
+  - записывает transcript в `messages.text` (заменяет placeholder `<media:audio>`)
+  - сохраняет диагностические метаданные в `raw_json.waArchiveIngestDiag`
+- удаляет уведомление (`deleteNotification`) после обработки (кроме dry-run)
+- добавлены safe-флаги:
+  - `--max-events N`
+  - `--since <ts|id>` (best-effort)
+  - `--dry-run` (без write/delete/media/transcribe)
+
+> Текущий embeddings-пайплайн подхватывает transcript автоматически, т.к. он лежит в `messages.text`.
+
+---
 
 ## Структура
 
@@ -27,12 +34,13 @@
 ├── README.md
 └── scripts
     ├── greenapi_ingest.py
-    └── smoke_check.sh
+    ├── smoke_check.sh
+    └── verify_media_transcript.sh
 ```
 
-## Быстрый старт
+---
 
-1. Подготовь окружение:
+## Подготовка
 
 ```bash
 cd /home/openclaw/.openclaw/workspace/integrations/wa-greenapi-ingest-skill
@@ -40,32 +48,127 @@ cp .env.example .env
 # заполни .env
 ```
 
-2. Проверка smoke:
+Если нужен OpenAI-транскриб, экспортируй ключ:
+
+```bash
+export OPENAI_API_KEY=...
+```
+
+(Если ключа нет, скрипт попробует local `whisper` / `whisper-cli`.)
+
+---
+
+## Быстрый smoke
 
 ```bash
 ./scripts/smoke_check.sh
 ```
 
-3. Одноразовый ingest (1 уведомление):
+Smoke проверяет:
+- синтаксис Python
+- dry-run ingest 1 события
+- наличие verify-скрипта
+
+---
+
+## Тестовый прогон на малом объёме (5–20 событий)
+
+### 1) Dry-run (без удаления queue)
 
 ```bash
 set -a && source .env && set +a
-python3 scripts/greenapi_ingest.py ingest-once
+python3 scripts/greenapi_ingest.py ingest-once \
+  --dry-run \
+  --max-events 5 \
+  --verbose
 ```
 
-4. Непрерывный polling:
+### 2) Реальный ingest 5–20 событий
 
 ```bash
 set -a && source .env && set +a
-python3 scripts/greenapi_ingest.py run
+python3 scripts/greenapi_ingest.py ingest-once \
+  --max-events 10 \
+  --verbose
 ```
 
-## Совместимость с существующим pipeline
+или (например, limit 20):
 
-Скрипт создает/использует таблицу `messages` в формате:
+```bash
+python3 scripts/greenapi_ingest.py ingest-once --max-events 20 --verbose
+```
+
+### 3) Опционально ограничить по времени/ID
+
+```bash
+# по timestamp (unix или ISO)
+python3 scripts/greenapi_ingest.py ingest-once --max-events 20 --since 1700000000
+python3 scripts/greenapi_ingest.py ingest-once --max-events 20 --since 2026-03-05T00:00:00Z
+
+# по source_message_id (best-effort queue-order gate)
+python3 scripts/greenapi_ingest.py ingest-once --max-events 20 --since BAE5F3...
+```
+
+---
+
+## Проверка media + transcript в БД
+
+```bash
+./scripts/verify_media_transcript.sh ./wa_archive.db
+```
+
+Скрипт возвращает JSON:
+- `ok=true`, если нашёл хотя бы одну строку `messages` (source_type=`greenapi`) где:
+  - есть `raw_json.waArchiveIngestDiag.mediaDownload.path`, файл физически существует
+  - есть `raw_json.waArchiveIngestDiag.transcription.ok=true`
+  - `messages.text` уже не placeholder `<media:...>`
+
+Exit code:
+- `0` — проверка успешна
+- `1` — подходящих строк не найдено
+- `2` — ошибка (например, не найдена БД)
+
+---
+
+## Непрерывный режим
+
+```bash
+set -a && source .env && set +a
+python3 scripts/greenapi_ingest.py run \
+  --poll-sleep 0.5 \
+  --max-events 20 \
+  --verbose
+```
+
+`--max-events 0` в `run` = без лимита.
+
+---
+
+## Важные детали реализации
+
+- Media download делает robust fallback:
+  1. URL/path из webhook (`downloadUrl`, `urlFile`, `filePath`, `path`, и т.д.)
+  2. сборка вариантов через `GREENAPI_MEDIA_URL` и `GREENAPI_API_URL`
+  3. fallback через `downloadFile` API (`POST /downloadFile/{token}` с `chatId` + `idMessage`)
+- Если media API у конкретного payload-формата не совпал, скрипт пишет явный warning + TODO в diag (`raw_json`), не падает.
+- `--dry-run` специально **не удаляет notification из очереди**.
+
+---
+
+## Ограничения Phase 2
+
+- `--since <id>` реализован как queue-order gate (best-effort), не как random access по истории.
+- Для транскриба нужен либо `OPENAI_API_KEY`, либо доступный локальный `whisper`/`whisper-cli`.
+- Некоторые редкие форматы media payload GREEN-API могут потребовать отдельного endpoint-паттерна (логируется как TODO).
+
+---
+
+## Совместимость
+
+Таблица `messages` остаётся совместимой с текущим `wa_archive.db` pipeline:
 
 - `ts`
-- `direction` (`in` / `out`)
+- `direction`
 - `peer`
 - `text`
 - `raw_json`
@@ -73,24 +176,4 @@ python3 scripts/greenapi_ingest.py run
 - `source_type`
 - `source_message_id`
 
-Это совместимо с текущей моделью `wa_archive.db` и embeddings-процессом (который читает `messages.text`).
-
-## Важные детали MVP
-
-- MVP архивирует только message-события (не все service webhook-и).
-- Дедупликация:
-  - по `source_type + source_message_id` (если есть `idMessage`)
-  - fallback-уникальность по `(source_type, ts, direction, peer, text)`
-- Для `audio/voice` используется placeholder `<media:audio>`.
-- Для остальных медиа — `<media:<type>>`.
-
-## Ограничения MVP
-
-- Нет скачивания и локального хранения media-файлов.
-- Нет ретраев с backoff и продвинутого dead-letter механизма.
-- Нет systemd/supervisor unit в этом репо (запуск вручную/через ваш оркестратор).
-
-## Безопасность
-
-- Не коммить `.env` и реальные токены.
-- Рекомендуется ограничить права доступа к папке и БД.
+Bridge/автоответы не затрагиваются (изменения только в ingest-репозитории).
