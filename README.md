@@ -1,200 +1,126 @@
 # wa-greenapi-ingest-skill (text-first media policy)
 
-Отдельный ingest-проект для импорта WhatsApp событий из **GREEN-API** в SQLite-архив `wa_archive.db`.
+Импорт WhatsApp событий из **GREEN-API** в SQLite `wa_archive.db`.
 
-## Что делает сейчас
+## Что делает
 
-- читает переменные окружения:
-  - `GREENAPI_API_URL`
-  - `GREENAPI_MEDIA_URL`
-  - `GREENAPI_INSTANCE_TOKEN`
-- поддерживает источники событий:
-  - `queue` → `receiveNotification`
-  - `history` → `lastOutgoingMessages` + `lastIncomingMessages`
-  - `auto` (default) → сначала `queue`, если 0 событий — fallback на `history`
-- нормализует queue/history события в одну схему таблицы `messages`
-- history direction mapping:
-  - `lastOutgoingMessages` -> `direction=out`
-  - `lastIncomingMessages` -> `direction=in`
-- дедуплицирует по `source_message_id` (`idMessage`) и fallback-ключу
+- читает queue/history из GREEN-API
+- нормализует в таблицу `messages`
+- дедуплицирует по `source_message_id`
+- обогащает media по text-first политике
 
-## Новая политика хранения media (text-first)
+## Политика анализа контента (обновлено)
 
-По умолчанию бинарные media-файлы **не накапливаются**.
+### 1) Единый backend image/doc анализа
 
-### Image
-- временно скачивает image
-- делает описание содержимого через настраиваемый backend:
-  - `GREENAPI_IMAGE_DESCRIBE_BACKEND=auto` (default): **OpenClaw gateway** -> OpenAI
-  - `GREENAPI_IMAGE_DESCRIBE_BACKEND=openclaw`: только OpenClaw
-  - `GREENAPI_IMAGE_DESCRIBE_BACKEND=openai`: только OpenAI
-- при успехе сохраняет в `messages.text` нормальный description-текст (без meta-prefix)
-- при ошибке backend **не** пишет meta-fallback в `text`; ставит только `[image description failed]` и `raw_json.waArchiveIngestDiag.imageDescription.pending_reprocess=true`
-- удаляет локальный файл при `GREENAPI_KEEP_MEDIA_FILES=0`
+Приоритет backend: **OpenClaw gateway** (`GREENAPI_CONTENT_ANALYZE_BACKEND=auto|openclaw|openai`).
 
-### Audio/Voice
-- временно скачивает audio/voice
-- делает транскрипцию (OpenAI Whisper → fallback local `whisper`/`whisper-cli`)
-- сохраняет в `messages.text` финальный текст транскрипта
-- удаляет локальный файл при `GREENAPI_KEEP_MEDIA_FILES=0`
+Промпт анализа для image/doc теперь строго двухблочный:
 
-### Остальные media (video/docs/stickers/...)
-- бинарь не сохраняет
-- пишет мета-текст в `messages.text` + диагностику в `raw_json`
+1. **БЛОК 1 — SUMMARY** (кратко, факты)
+2. **БЛОК 2 — VISIBLE_TEXT** (максимально полный видимый текст, дословно, с маркером `[неразборчиво]`)
 
-### Диагностика в `raw_json`
-В `raw_json.waArchiveIngestDiag` добавляются поля:
+### 2) PDF политика
+
+- `pages <= GREENAPI_PDF_MAX_PAGES` (default 20): обрабатывается **весь документ**
+- `pages > GREENAPI_PDF_MAX_PAGES`: полный анализ **не выполняется**, ставится:
+  - `status=skip`
+  - `reason=too_many_pages`
+  - `pending_reprocess=true`
+  - `manual=true`
+- без постраничного распила в этом шаге
+
+### 3) Text/code файлы
+
+Для `txt/md/json/yaml/py/js/ts/sh/log/csv/xml/html` и `text/*`:
+
+- файл читается целиком (в пределах safeguard)
+- итоговый текст сохраняется в `messages.text` (для поиска/эмбеддингов)
+- safeguard (по умолчанию permissive):
+  - `GREENAPI_TEXT_ANALYZE_MAX_BYTES=8388608`
+  - `GREENAPI_TEXT_ANALYZE_MAX_CHARS=2000000`
+
+### 4) Office (doc/docx/xls/xlsx)
+
+- если текст извлекается — сохраняется целиком
+- если не извлекается — ставится fail marker (`[office extraction failed]`) без мусорного fallback
+
+### 5) Бинарники media не храним (по умолчанию)
+
+`GREENAPI_KEEP_MEDIA_FILES=0` → временно скачанный файл удаляется после обработки.
+
+## Диагностика в `raw_json.waArchiveIngestDiag`
+
+Основные блоки:
+
 - `textFirstPolicy`
 - `mediaDownload`
-- `mediaStorage` (в т.ч. `binaryDeleted` / `binaryStored` / `pathExistsAfterProcessing`)
-- `transcription` (для audio)
-- `imageDescription` (для image, включая `pending_reprocess` при ошибке describe)
-
----
-
-## Структура
-
-```text
-.
-├── .env.example
-├── README.md
-└── scripts
-    ├── greenapi_ingest.py
-    ├── history_direction_selfcheck.py
-    ├── smoke_check.sh
-    └── verify_media_transcript.sh
-```
-
----
-
-## Подготовка
-
-```bash
-cd /home/openclaw/.openclaw/workspace/integrations/wa-greenapi-ingest-skill
-cp .env.example .env
-# заполни .env
-```
-
-Если нужен OpenAI-транскриб/vision (fallback или backend=openai):
-
-```bash
-export OPENAI_API_KEY=...
-```
-
-Для OpenClaw-native image describe (без отдельного OpenAI key для картинок):
-
-```bash
-export OPENCLAW_GATEWAY_URL=http://127.0.0.1:18789
-# auth: укажи либо password, либо token (в зависимости от gateway.auth.mode)
-export OPENCLAW_GATEWAY_PASSWORD=...
-# export OPENCLAW_GATEWAY_TOKEN=...
-```
-
----
+- `mediaStorage`
+- `transcription` (audio)
+- `imageDescription` (image)
+- `documentAnalysis` (pdf/text/office)
+- `contentAnalysis` (унифицированная диагностика image/doc backend)
 
 ## Ключевые env
 
 ```bash
-GREENAPI_KEEP_MEDIA_FILES=0                # default: удалять временные файлы
-GREENAPI_DESCRIBE_IMAGES=1                 # default: включено
-GREENAPI_TRANSCRIBE_AUDIO=1                # default: включено
-GREENAPI_IMAGE_DESCRIBE_BACKEND=auto       # auto|openclaw|openai
+GREENAPI_KEEP_MEDIA_FILES=0
+GREENAPI_DESCRIBE_IMAGES=1
+GREENAPI_TRANSCRIBE_AUDIO=1
+
+GREENAPI_CONTENT_ANALYZE_BACKEND=auto   # auto|openclaw|openai
+GREENAPI_IMAGE_DESCRIBE_BACKEND=auto    # legacy fallback var
 OPENCLAW_GATEWAY_URL=http://127.0.0.1:18789
+OPENCLAW_CONTENT_ANALYZE_TIMEOUT_SEC=120
 OPENCLAW_GATEWAY_PASSWORD=
 OPENCLAW_GATEWAY_TOKEN=
+
+GREENAPI_PDF_MAX_PAGES=20
+GREENAPI_TEXT_ANALYZE_MAX_BYTES=8388608
+GREENAPI_TEXT_ANALYZE_MAX_CHARS=2000000
 ```
 
-Дополнительно:
-
-```bash
-GREENAPI_DESCRIBE_MODEL=gpt-4o-mini
-GREENAPI_TRANSCRIBE_MODEL=whisper-1
-GREENAPI_TRANSCRIBE_LANGUAGE=
-```
-
----
-
-## Быстрый smoke
+## Smoke / minitest
 
 ```bash
 ./scripts/smoke_check.sh
 ```
 
-Отдельный mini-test backend failure handling:
+Внутри smoke:
+
+- `python3 -m py_compile scripts/greenapi_ingest.py`
+- `python3 scripts/history_direction_selfcheck.py`
+- `python3 scripts/minitest_openclaw_image_backend.py`
+- `python3 scripts/minitest_content_policy.py`
+- dry-run ingest-once
+
+## Отдельные тесты новой политики
 
 ```bash
-python3 scripts/minitest_openclaw_image_backend.py
+python3 scripts/minitest_content_policy.py
 ```
 
-Smoke проверяет:
-- синтаксис Python
-- self-check direction mapping (`scripts/history_direction_selfcheck.py`)
-- minitest OpenClaw image backend: при недоступном gateway нет meta-fallback и ставится marker failed
-- dry-run ingest 1 события
-- наличие verify-скрипта
+Проверяет:
 
----
+- PDF <=20 страниц: full processed
+- PDF >20 страниц: skipped (`too_many_pages`) + `pending_reprocess/manual=true`
+- text file: full analyzed
+- keep=0 cleanup временных файлов
 
 ## Запуск ingest
 
-### ingest-once
+```bash
+set -a && source .env && set +a
+python3 scripts/greenapi_ingest.py ingest-once --source auto --max-events 20 --verbose
+```
 
 ```bash
 set -a && source .env && set +a
-python3 scripts/greenapi_ingest.py ingest-once \
-  --source auto \
-  --max-events 20 \
-  --verbose
+python3 scripts/greenapi_ingest.py run --source auto --poll-sleep 0.5 --max-events 20 --verbose
 ```
-
-### run
-
-```bash
-set -a && source .env && set +a
-python3 scripts/greenapi_ingest.py run \
-  --source auto \
-  --poll-sleep 0.5 \
-  --max-events 20 \
-  --verbose
-```
-
-### Полезные флаги CLI
-
-```bash
---no-describe-images
---no-transcribe-audio
---keep-media-files
---describe-model gpt-4o-mini
---transcribe-model whisper-1
---transcribe-language ru
---dry-run
---since <unix-ts|iso|source_message_id>
-```
-
----
 
 ## Verify text-first
 
 ```bash
 ./scripts/verify_media_transcript.sh ./wa_archive.db 300 ./data/media
 ```
-
-Проверяет:
-- есть текстовые записи для `image/audio` (без `<media:...>` placeholder)
-- при `GREENAPI_KEEP_MEDIA_FILES=0` нет сохранённых файлов (по DB-диагностике и по фактическим файлам в media-dir)
-
----
-
-## Совместимость с `wa_archive.db`
-
-Пишется в те же поля `messages`:
-- `ts`
-- `direction`
-- `peer`
-- `text`
-- `raw_json`
-- `source_line`
-- `source_type`
-- `source_message_id`
-
-Bridge/автоответы не затрагиваются (изменения только в ingest-репозитории).

@@ -34,6 +34,9 @@ python3 "$ROOT_DIR/scripts/history_direction_selfcheck.py"
 echo "[smoke] minitest: image describe success/failure + no meta fallback + cleanup keep=0"
 python3 "$ROOT_DIR/scripts/minitest_openclaw_image_backend.py"
 
+echo "[smoke] minitest: content policy (PDF<=20 full, PDF>20 skip, text full)"
+python3 "$ROOT_DIR/scripts/minitest_content_policy.py"
+
 echo "[smoke] Пробный прием 1 уведомления в dry-run (без записи в БД / media / transcript и без deleteNotification)"
 python3 "$INGEST_SCRIPT" ingest-once --dry-run --max-events 1 --verbose
 

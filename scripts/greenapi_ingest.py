@@ -5,6 +5,9 @@ Phase 2 ingest для GREEN-API -> wa_archive.db (таблица messages).
 Что добавлено поверх MVP:
 - media download (GREENAPI_MEDIA_URL + robust fallback по URL/path/endpoint)
 - voice/audio транскрипция (OpenAI Whisper first, local whisper fallback)
+- image/doc анализ через OpenClaw gateway (приоритет) c 2-блочным выводом SUMMARY+VISIBLE_TEXT
+- PDF policy: <=N pages full-process, >N pages skip(reason=too_many_pages)
+- text/code/office extraction policy для поиска и эмбеддингов
 - безопасные режимы тестового запуска (--max-events, --since, --dry-run)
 """
 
@@ -27,6 +30,8 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import zipfile
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any
 
@@ -56,12 +61,21 @@ DEFAULT_TRANSCRIBE_AUDIO = str(os.getenv("GREENAPI_TRANSCRIBE_AUDIO", "1")).stri
 }
 DEFAULT_DESCRIBE_MODEL = str(os.getenv("GREENAPI_DESCRIBE_MODEL", "gpt-4o-mini")).strip() or "gpt-4o-mini"
 DEFAULT_IMAGE_DESCRIBE_BACKEND = str(os.getenv("GREENAPI_IMAGE_DESCRIBE_BACKEND", "auto")).strip().lower() or "auto"
+DEFAULT_CONTENT_ANALYZE_BACKEND = (
+    str(os.getenv("GREENAPI_CONTENT_ANALYZE_BACKEND", DEFAULT_IMAGE_DESCRIBE_BACKEND)).strip().lower()
+    or DEFAULT_IMAGE_DESCRIBE_BACKEND
+)
 DEFAULT_OPENCLAW_GATEWAY_URL = str(os.getenv("OPENCLAW_GATEWAY_URL", "http://127.0.0.1:18789")).strip() or "http://127.0.0.1:18789"
 DEFAULT_OPENCLAW_GATEWAY_PASSWORD = str(os.getenv("OPENCLAW_GATEWAY_PASSWORD", "")).strip()
 DEFAULT_OPENCLAW_GATEWAY_TOKEN = str(os.getenv("OPENCLAW_GATEWAY_TOKEN", "")).strip()
-DEFAULT_OPENCLAW_DESCRIBE_TIMEOUT = int(os.getenv("OPENCLAW_IMAGE_DESCRIBE_TIMEOUT_SEC", "120"))
+DEFAULT_OPENCLAW_DESCRIBE_TIMEOUT = int(
+    os.getenv("OPENCLAW_CONTENT_ANALYZE_TIMEOUT_SEC", os.getenv("OPENCLAW_IMAGE_DESCRIBE_TIMEOUT_SEC", "120"))
+)
 DEFAULT_TRANSCRIBE_MODEL = str(os.getenv("GREENAPI_TRANSCRIBE_MODEL", "whisper-1")).strip() or "whisper-1"
 DEFAULT_TRANSCRIBE_LANGUAGE = str(os.getenv("GREENAPI_TRANSCRIBE_LANGUAGE", "")).strip() or None
+DEFAULT_TEXT_ANALYZE_MAX_BYTES = int(os.getenv("GREENAPI_TEXT_ANALYZE_MAX_BYTES", str(8 * 1024 * 1024)))
+DEFAULT_TEXT_ANALYZE_MAX_CHARS = int(os.getenv("GREENAPI_TEXT_ANALYZE_MAX_CHARS", "2000000"))
+DEFAULT_PDF_MAX_PAGES = int(os.getenv("GREENAPI_PDF_MAX_PAGES", "20"))
 DEFAULT_HTTP_TIMEOUT = int(os.getenv("GREENAPI_HTTP_TIMEOUT_SEC", "45"))
 
 SOURCE_QUEUE = "queue"
@@ -92,6 +106,55 @@ MEDIA_BLOCK_KEYS = (
     "stickerMessageData",
     "extendedTextMessageData",
 )
+
+TEXT_LIKE_EXTENSIONS = {
+    ".txt",
+    ".md",
+    ".markdown",
+    ".json",
+    ".yaml",
+    ".yml",
+    ".ini",
+    ".cfg",
+    ".conf",
+    ".py",
+    ".js",
+    ".ts",
+    ".tsx",
+    ".jsx",
+    ".sh",
+    ".bash",
+    ".zsh",
+    ".log",
+    ".csv",
+    ".xml",
+    ".html",
+    ".htm",
+    ".sql",
+    ".toml",
+    ".env",
+}
+
+TEXT_LIKE_MIME_HINTS = {
+    "application/json",
+    "application/xml",
+    "application/javascript",
+    "application/x-javascript",
+    "application/x-yaml",
+    "application/yaml",
+    "application/toml",
+    "application/csv",
+    "application/sql",
+}
+
+OFFICE_EXTENSIONS = {".doc", ".docx", ".xls", ".xlsx"}
+OFFICE_MIME_HINTS = {
+    "application/msword",
+    "application/vnd.ms-word",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "application/vnd.ms-excel",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+}
 
 
 def _setup_logging(verbose: bool = False) -> None:
@@ -1113,6 +1176,60 @@ def _openclaw_chat_completions_text(
     raise RuntimeError("OpenClaw request failed: no auth method succeeded")
 
 
+def _build_content_analysis_prompt(kind: str = "image") -> str:
+    target = {
+        "image": "изображение",
+        "pdf": "PDF-документ",
+        "office": "office-документ",
+        "document": "документ",
+    }.get(str(kind or "").strip().lower(), "документ")
+
+    return (
+        f"Ты анализируешь вложение WhatsApp ({target}) для архивного поиска.\n"
+        "Верни ответ строго в двух блоках и ничего не добавляй вне формата.\n\n"
+        "БЛОК 1 — SUMMARY:\n"
+        "Кратко опиши, что на файле/в документе (1-3 предложения, только факты, без домыслов).\n\n"
+        "БЛОК 2 — VISIBLE_TEXT:\n"
+        "Приведи максимально полный видимый текст дословно.\n"
+        "Сохраняй переносы строк и порядок чтения.\n"
+        "Если фрагмент не читается — вставляй [неразборчиво].\n"
+        "Если текста нет совсем — напиши [текст не обнаружен]."
+    )
+
+
+def _analyze_file_via_openclaw_path(
+    path: Path,
+    mime_type: str,
+    *,
+    kind: str,
+    gateway_url: str = DEFAULT_OPENCLAW_GATEWAY_URL,
+    timeout_sec: int = DEFAULT_OPENCLAW_DESCRIBE_TIMEOUT,
+) -> tuple[str, str]:
+    local_path = str(path.resolve())
+    payload_path_prompt = {
+        "model": "openclaw",
+        "temperature": 0,
+        "messages": [
+            {
+                "role": "user",
+                "content": (
+                    f"{_build_content_analysis_prompt(kind)}\n"
+                    f"Локальный путь к файлу: {local_path}\n"
+                    f"MIME (если известен): {str(mime_type or '').strip() or 'unknown'}\n"
+                    "Проанализируй весь файл целиком и верни оба блока."
+                ),
+            }
+        ],
+    }
+
+    txt, auth_mode = _openclaw_chat_completions_text(
+        payload_path_prompt,
+        gateway_url=gateway_url,
+        timeout_sec=timeout_sec,
+    )
+    return txt, f"openclaw-gateway:chat-completions:path:{auth_mode}"
+
+
 def describe_image_via_openclaw(
     path: Path,
     mime_type: str = "",
@@ -1131,14 +1248,9 @@ def describe_image_via_openclaw(
     b64 = base64.b64encode(img_bytes).decode("ascii")
     data_uri = f"data:{img_mime};base64,{b64}"
 
-    prompt_common = (
-        "Опиши изображение кратко и по фактам для полнотекстового поиска в архиве сообщений. "
-        "1-2 предложения, без домыслов."
-    )
-
+    prompt_common = _build_content_analysis_prompt("image")
     attempts: list[str] = []
 
-    # Attempt 1: OpenAI-compatible image_url content (если endpoint поддерживает multimodal блоки).
     payload_image_url = {
         "model": "openclaw",
         "temperature": 0,
@@ -1152,6 +1264,7 @@ def describe_image_via_openclaw(
             }
         ],
     }
+
     try:
         txt, auth_mode = _openclaw_chat_completions_text(
             payload_image_url,
@@ -1164,33 +1277,41 @@ def describe_image_via_openclaw(
     except Exception as e:
         attempts.append(f"image_url attempt failed: {e}")
 
-    # Attempt 2: path adapter (работает с текущим OpenClaw endpoint, где chat payload сводится к text).
-    local_path = str(path.resolve())
-    payload_path_prompt = {
-        "model": "openclaw",
-        "temperature": 0,
-        "messages": [
-            {
-                "role": "user",
-                "content": (
-                    f"{prompt_common}\n"
-                    f"Локальный путь к изображению: {local_path}\n"
-                    "Используй доступные инструменты анализа изображения, если нужно."
-                ),
-            }
-        ],
-    }
-
     try:
-        txt, auth_mode = _openclaw_chat_completions_text(
-            payload_path_prompt,
+        txt, engine = _analyze_file_via_openclaw_path(
+            path,
+            mime_type=img_mime,
+            kind="image",
             gateway_url=gateway_url,
             timeout_sec=timeout_sec,
         )
-        return txt, f"openclaw-gateway:chat-completions:path:{auth_mode}"
+        return txt, engine
     except Exception as e:
         attempts.append(f"path adapter failed: {e}")
         raise RuntimeError(" | ".join(attempts))
+
+
+def analyze_document_via_openclaw(
+    path: Path,
+    mime_type: str = "",
+    *,
+    kind: str = "document",
+    gateway_url: str = DEFAULT_OPENCLAW_GATEWAY_URL,
+    timeout_sec: int = DEFAULT_OPENCLAW_DESCRIBE_TIMEOUT,
+) -> tuple[str, str]:
+    if not path.exists():
+        raise RuntimeError(f"file not found: {path}")
+    txt, engine = _analyze_file_via_openclaw_path(
+        path,
+        mime_type=mime_type,
+        kind=kind,
+        gateway_url=gateway_url,
+        timeout_sec=timeout_sec,
+    )
+    txt = str(txt or "").strip()
+    if not txt:
+        raise RuntimeError("OpenClaw document analysis returned empty text")
+    return txt, engine
 
 
 def describe_image_openai(path: Path, mime_type: str = "", model: str = DEFAULT_DESCRIBE_MODEL, timeout_sec: int = 240) -> tuple[str, str]:
@@ -1221,10 +1342,7 @@ def describe_image_openai(path: Path, mime_type: str = "", model: str = DEFAULT_
                 "content": [
                     {
                         "type": "text",
-                        "text": (
-                            "Опиши изображение кратко и по фактам для полнотекстового поиска в архиве сообщений. "
-                            "1-2 предложения, без домыслов."
-                        ),
+                        "text": _build_content_analysis_prompt("image"),
                     },
                     {
                         "type": "image_url",
@@ -1272,23 +1390,28 @@ def describe_image_openai(path: Path, mime_type: str = "", model: str = DEFAULT_
     return txt, f"openai-vision:{model}"
 
 
-def describe_image_with_fallback(
+def analyze_content_with_fallback(
     path: Path,
     mime_type: str,
+    *,
+    kind: str,
     model: str = DEFAULT_DESCRIBE_MODEL,
-    backend: str = DEFAULT_IMAGE_DESCRIBE_BACKEND,
+    backend: str = DEFAULT_CONTENT_ANALYZE_BACKEND,
 ) -> tuple[str, str, list[str]]:
     errs: list[str] = []
     backend_mode = _normalize_image_describe_backend(backend)
 
     if backend_mode in {"auto", "openclaw"}:
         try:
-            txt, engine = describe_image_via_openclaw(path, mime_type=mime_type)
+            if str(kind).lower() == "image":
+                txt, engine = describe_image_via_openclaw(path, mime_type=mime_type)
+            else:
+                txt, engine = analyze_document_via_openclaw(path, mime_type=mime_type, kind=kind)
             return txt, engine, errs
         except Exception as e:
             errs.append(f"openclaw: {e}")
 
-    if backend_mode in {"auto", "openai"}:
+    if str(kind).lower() == "image" and backend_mode in {"auto", "openai"}:
         try:
             txt, engine = describe_image_openai(path, mime_type=mime_type, model=model)
             return txt, engine, errs
@@ -1297,7 +1420,22 @@ def describe_image_with_fallback(
 
     if errs:
         raise RuntimeError(" | ".join(errs))
-    raise RuntimeError(f"No image describe backend available for mode={backend_mode}")
+    raise RuntimeError(f"No analyze backend available for kind={kind} mode={backend_mode}")
+
+
+def describe_image_with_fallback(
+    path: Path,
+    mime_type: str,
+    model: str = DEFAULT_DESCRIBE_MODEL,
+    backend: str = DEFAULT_CONTENT_ANALYZE_BACKEND,
+) -> tuple[str, str, list[str]]:
+    return analyze_content_with_fallback(
+        path,
+        mime_type,
+        kind="image",
+        model=model,
+        backend=backend,
+    )
 
 
 def normalize_notification(notification: dict[str, Any], media_url: str) -> dict[str, Any] | None:
@@ -1713,6 +1851,167 @@ def upsert_message(conn: sqlite3.Connection, row: dict[str, Any]) -> str:
     return "inserted" if cur.rowcount else "duplicate"
 
 
+def _extension_from_name(file_name: str) -> str:
+    return Path(str(file_name or "").strip().lower()).suffix
+
+
+def _detect_media_content_kind(meta: dict[str, Any]) -> str:
+    if _is_truthy(meta.get("isAudio")):
+        return "audio"
+    if _is_truthy(meta.get("isImage")):
+        return "image"
+
+    mime_type = str(meta.get("mimeType") or "").strip().lower()
+    ext = _extension_from_name(str(meta.get("fileName") or ""))
+
+    if mime_type == "application/pdf" or ext == ".pdf":
+        return "pdf"
+
+    if mime_type.startswith("text/") or mime_type in TEXT_LIKE_MIME_HINTS or ext in TEXT_LIKE_EXTENSIONS:
+        return "text"
+
+    if mime_type in OFFICE_MIME_HINTS or ext in OFFICE_EXTENSIONS:
+        return "office"
+
+    return "other"
+
+
+def _trim_text_to_limit(text: str, max_chars: int) -> tuple[str, bool]:
+    if max_chars <= 0:
+        return text, False
+    if len(text) <= max_chars:
+        return text, False
+    return text[:max_chars], True
+
+
+def _decode_text_bytes(raw: bytes) -> str:
+    try:
+        return raw.decode("utf-8")
+    except Exception:
+        return raw.decode("utf-8", errors="replace")
+
+
+def _read_text_file_full(
+    path: Path,
+    *,
+    max_bytes: int = DEFAULT_TEXT_ANALYZE_MAX_BYTES,
+    max_chars: int = DEFAULT_TEXT_ANALYZE_MAX_CHARS,
+) -> dict[str, Any]:
+    blob = path.read_bytes()
+    total_bytes = len(blob)
+    bytes_truncated = False
+
+    if max_bytes > 0 and total_bytes > max_bytes:
+        blob = blob[:max_bytes]
+        bytes_truncated = True
+
+    text_val = _decode_text_bytes(blob)
+    text_val, chars_truncated = _trim_text_to_limit(text_val, max_chars=max_chars)
+
+    return {
+        "ok": bool(text_val.strip()),
+        "text": text_val,
+        "totalBytes": total_bytes,
+        "usedBytes": len(blob),
+        "bytesTruncated": bytes_truncated,
+        "charsTruncated": chars_truncated,
+    }
+
+
+def _extract_xml_text(raw: bytes) -> str:
+    try:
+        root = ET.fromstring(raw)
+    except Exception:
+        return ""
+    chunks = [str(x).strip() for x in root.itertext() if str(x or "").strip()]
+    return "\n".join(chunks)
+
+
+def _extract_docx_text(path: Path) -> str:
+    chunks: list[str] = []
+    with zipfile.ZipFile(path, "r") as zf:
+        for name in ("word/document.xml", "word/footnotes.xml", "word/endnotes.xml"):
+            if name not in zf.namelist():
+                continue
+            raw = zf.read(name)
+            txt = _extract_xml_text(raw)
+            if txt:
+                chunks.append(txt)
+    return "\n\n".join(chunks).strip()
+
+
+def _extract_xlsx_text(path: Path) -> str:
+    chunks: list[str] = []
+    with zipfile.ZipFile(path, "r") as zf:
+        for name in sorted(zf.namelist()):
+            if not name.endswith(".xml"):
+                continue
+            if not (name.startswith("xl/") or name.startswith("docProps/")):
+                continue
+            raw = zf.read(name)
+            txt = _extract_xml_text(raw)
+            if txt:
+                chunks.append(txt)
+    return "\n\n".join(chunks).strip()
+
+
+def _extract_office_text(path: Path) -> tuple[str, str]:
+    ext = _extension_from_name(path.name)
+
+    if ext == ".docx":
+        return _extract_docx_text(path), "zip-xml:docx"
+    if ext == ".xlsx":
+        return _extract_xlsx_text(path), "zip-xml:xlsx"
+
+    if ext == ".doc":
+        for cmd in (["antiword", str(path)], ["catdoc", str(path)]):
+            if not shutil.which(cmd[0]):
+                continue
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+            if proc.returncode == 0:
+                txt = str(proc.stdout or "").strip()
+                if txt:
+                    return txt, f"cli:{cmd[0]}"
+        raise RuntimeError("legacy .doc text extractor is unavailable")
+
+    if ext == ".xls":
+        if shutil.which("xls2csv"):
+            proc = subprocess.run(["xls2csv", str(path)], capture_output=True, text=True, timeout=120)
+            if proc.returncode == 0:
+                txt = str(proc.stdout or "").strip()
+                if txt:
+                    return txt, "cli:xls2csv"
+        raise RuntimeError("legacy .xls text extractor is unavailable")
+
+    raise RuntimeError(f"unsupported office extension: {ext or 'unknown'}")
+
+
+def _count_pdf_pages(path: Path) -> int | None:
+    for mod_name in ("pypdf", "PyPDF2"):
+        try:
+            mod = __import__(mod_name)
+            reader = mod.PdfReader(str(path))
+            pages = len(reader.pages)
+            if pages > 0:
+                return pages
+        except Exception:
+            pass
+
+    try:
+        blob = path.read_bytes()
+    except Exception:
+        return None
+
+    matches = re.findall(rb"/Type\s*/Page(?!s)", blob)
+    if matches:
+        return len(matches)
+    return None
+
+
+def _set_document_failed_text(row: dict[str, Any], marker: str) -> None:
+    row["text"] = str(marker or "[document analysis failed]").strip()
+
+
 def _enrich_media_and_transcript(
     client: GreenApiClient,
     row: dict[str, Any],
@@ -1733,6 +2032,8 @@ def _enrich_media_and_transcript(
         "media_downloaded": 0,
         "transcribed": 0,
         "images_described": 0,
+        "docs_analyzed": 0,
+        "pdf_skipped": 0,
         "media_deleted": 0,
     }
 
@@ -1742,16 +2043,18 @@ def _enrich_media_and_transcript(
         row["raw_json"] = json.dumps(raw_obj, ensure_ascii=False)
         return result
 
-    is_audio = _is_truthy(meta.get("isAudio"))
-    is_image = _is_truthy(meta.get("isImage"))
-    needs_download = bool(is_audio or is_image)
+    content_kind = _detect_media_content_kind(meta)
+    needs_download = content_kind in {"audio", "image", "pdf", "text", "office"}
 
     diag["textFirstPolicy"] = {
         "keepMediaFiles": bool(keep_media_files),
         "describeImages": bool(describe_images),
         "transcribeAudio": bool(transcribe_audio),
-        "imageDescribeBackend": _normalize_image_describe_backend(DEFAULT_IMAGE_DESCRIBE_BACKEND),
+        "contentAnalyzeBackend": _normalize_image_describe_backend(DEFAULT_CONTENT_ANALYZE_BACKEND),
         "openclawGatewayUrl": DEFAULT_OPENCLAW_GATEWAY_URL,
+        "textAnalyzeMaxBytes": int(DEFAULT_TEXT_ANALYZE_MAX_BYTES),
+        "textAnalyzeMaxChars": int(DEFAULT_TEXT_ANALYZE_MAX_CHARS),
+        "pdfMaxPages": int(DEFAULT_PDF_MAX_PAGES),
     }
 
     media_info: dict[str, Any] | None = None
@@ -1765,7 +2068,7 @@ def _enrich_media_and_transcript(
         diag["mediaDownload"] = {
             "ok": False,
             "skipped": True,
-            "reason": "text-first: non-image/non-audio media is not downloaded",
+            "reason": "text-first: unsupported media kind for deep analysis",
         }
 
     if isinstance(media_info, dict) and media_info.get("ok"):
@@ -1773,7 +2076,7 @@ def _enrich_media_and_transcript(
 
     media_path = Path(str(media_info.get("path"))) if isinstance(media_info, dict) and media_info.get("ok") and media_info.get("path") else None
 
-    if is_audio:
+    if content_kind == "audio":
         if transcribe_audio and media_path is not None:
             try:
                 transcript, engine, fallback_errors = transcribe_with_fallback(
@@ -1783,11 +2086,7 @@ def _enrich_media_and_transcript(
                 )
                 transcript = transcript.strip()
                 if transcript:
-                    prev = str(row.get("text") or "").strip()
-                    if prev and not (prev.startswith("<media:") and prev.endswith(">")):
-                        row["text"] = f"{prev}\n[audio transcript] {transcript}"
-                    else:
-                        row["text"] = f"[audio transcript] {transcript}"
+                    row["text"] = f"[audio transcript] {transcript}"
                     diag["transcription"] = {
                         "ok": True,
                         "engine": engine,
@@ -1823,7 +2122,7 @@ def _enrich_media_and_transcript(
         if not current or (current.startswith("<media:") and current.endswith(">")):
             row["text"] = _build_media_meta_text(meta, suffix="transcript_unavailable")
 
-    if is_image:
+    elif content_kind == "image":
         image_mime = str(meta.get("mimeType") or "").strip()
         if describe_images and media_path is not None:
             try:
@@ -1831,20 +2130,22 @@ def _enrich_media_and_transcript(
                     media_path,
                     mime_type=image_mime,
                     model=describe_model,
-                    backend=DEFAULT_IMAGE_DESCRIBE_BACKEND,
+                    backend=DEFAULT_CONTENT_ANALYZE_BACKEND,
                 )
                 desc = str(desc or "").strip()
                 if desc:
-                    prev = str(row.get("text") or "").strip()
-                    if prev and not _is_media_placeholder_text(prev):
-                        row["text"] = f"{prev}\n{desc}"
-                    else:
-                        row["text"] = desc
+                    row["text"] = desc
                     diag["imageDescription"] = {
                         "ok": True,
                         "engine": engine,
                         "chars": len(desc),
                         "fallbackErrors": fallback_errors,
+                        "pending_reprocess": False,
+                    }
+                    diag["contentAnalysis"] = {
+                        "ok": True,
+                        "kind": "image",
+                        "engine": engine,
                         "pending_reprocess": False,
                     }
                     result["images_described"] = 1
@@ -1858,6 +2159,12 @@ def _enrich_media_and_transcript(
             except Exception as e:
                 diag["imageDescription"] = {
                     "ok": False,
+                    "error": str(e),
+                    "pending_reprocess": True,
+                }
+                diag["contentAnalysis"] = {
+                    "ok": False,
+                    "kind": "image",
                     "error": str(e),
                     "pending_reprocess": True,
                 }
@@ -1878,7 +2185,140 @@ def _enrich_media_and_transcript(
                 "pending_reprocess": False,
             }
 
-    if not needs_download:
+    elif content_kind == "pdf":
+        if media_path is None:
+            diag["documentAnalysis"] = {
+                "ok": False,
+                "kind": "pdf",
+                "error": "pdf media not downloaded",
+                "pending_reprocess": True,
+            }
+            _set_document_failed_text(row, "[pdf analysis failed]")
+        else:
+            pages = _count_pdf_pages(media_path)
+            max_pages = max(1, int(DEFAULT_PDF_MAX_PAGES))
+            if pages is not None and pages > max_pages:
+                diag["documentAnalysis"] = {
+                    "ok": False,
+                    "kind": "pdf",
+                    "status": "skip",
+                    "reason": "too_many_pages",
+                    "pages": int(pages),
+                    "maxPages": int(max_pages),
+                    "pending_reprocess": True,
+                    "manual": True,
+                }
+                row["text"] = "[pdf skipped: too_many_pages]"
+                result["pdf_skipped"] = 1
+            else:
+                try:
+                    analyzed_text, engine, fallback_errors = analyze_content_with_fallback(
+                        media_path,
+                        mime_type=str(meta.get("mimeType") or "application/pdf"),
+                        kind="pdf",
+                        model=describe_model,
+                        backend=DEFAULT_CONTENT_ANALYZE_BACKEND,
+                    )
+                    analyzed_text = str(analyzed_text or "").strip()
+                    if not analyzed_text:
+                        raise RuntimeError("empty document analysis")
+                    row["text"] = analyzed_text
+                    diag["documentAnalysis"] = {
+                        "ok": True,
+                        "kind": "pdf",
+                        "engine": engine,
+                        "pages": pages,
+                        "fallbackErrors": fallback_errors,
+                        "pending_reprocess": False,
+                    }
+                    result["docs_analyzed"] = 1
+                except Exception as e:
+                    diag["documentAnalysis"] = {
+                        "ok": False,
+                        "kind": "pdf",
+                        "error": str(e),
+                        "pages": pages,
+                        "pending_reprocess": True,
+                        "manual": True,
+                    }
+                    _set_document_failed_text(row, "[pdf analysis failed]")
+
+    elif content_kind == "text":
+        if media_path is None:
+            diag["documentAnalysis"] = {
+                "ok": False,
+                "kind": "text",
+                "error": "text media not downloaded",
+                "pending_reprocess": True,
+            }
+            _set_document_failed_text(row, "[text extraction failed]")
+        else:
+            extracted = _read_text_file_full(
+                media_path,
+                max_bytes=DEFAULT_TEXT_ANALYZE_MAX_BYTES,
+                max_chars=DEFAULT_TEXT_ANALYZE_MAX_CHARS,
+            )
+            if extracted.get("ok"):
+                row["text"] = str(extracted.get("text") or "")
+                diag["documentAnalysis"] = {
+                    "ok": True,
+                    "kind": "text",
+                    "engine": "local:text-read",
+                    "totalBytes": extracted.get("totalBytes"),
+                    "usedBytes": extracted.get("usedBytes"),
+                    "bytesTruncated": bool(extracted.get("bytesTruncated")),
+                    "charsTruncated": bool(extracted.get("charsTruncated")),
+                    "pending_reprocess": bool(extracted.get("bytesTruncated") or extracted.get("charsTruncated")),
+                }
+                result["docs_analyzed"] = 1
+            else:
+                diag["documentAnalysis"] = {
+                    "ok": False,
+                    "kind": "text",
+                    "error": "empty text extraction",
+                    "pending_reprocess": True,
+                }
+                _set_document_failed_text(row, "[text extraction failed]")
+
+    elif content_kind == "office":
+        if media_path is None:
+            diag["documentAnalysis"] = {
+                "ok": False,
+                "kind": "office",
+                "error": "office media not downloaded",
+                "pending_reprocess": True,
+                "manual": True,
+            }
+            _set_document_failed_text(row, "[office extraction failed]")
+        else:
+            try:
+                extracted_text, extractor = _extract_office_text(media_path)
+                extracted_text = str(extracted_text or "").strip()
+                extracted_text, chars_truncated = _trim_text_to_limit(extracted_text, DEFAULT_TEXT_ANALYZE_MAX_CHARS)
+                if not extracted_text:
+                    raise RuntimeError("empty office extraction")
+                row["text"] = extracted_text
+                diag["documentAnalysis"] = {
+                    "ok": True,
+                    "kind": "office",
+                    "engine": extractor,
+                    "chars": len(extracted_text),
+                    "charsTruncated": bool(chars_truncated),
+                    "pending_reprocess": bool(chars_truncated),
+                }
+                result["docs_analyzed"] = 1
+            except Exception as e:
+                diag["documentAnalysis"] = {
+                    "ok": False,
+                    "kind": "office",
+                    "error": str(e),
+                    "status": "fail",
+                    "pending_reprocess": True,
+                    "manual": True,
+                }
+                _set_document_failed_text(row, "[office extraction failed]")
+
+    else:
         current = str(row.get("text") or "").strip()
         if not current or (current.startswith("<media:") and current.endswith(">")):
             row["text"] = _build_media_meta_text(meta, suffix="binary_not_saved")
@@ -1941,6 +2381,8 @@ def _empty_stats(dry_run: bool) -> dict[str, Any]:
         "media_downloaded": 0,
         "transcribed": 0,
         "images_described": 0,
+        "docs_analyzed": 0,
+        "pdf_skipped": 0,
         "media_deleted": 0,
         "dry_run": bool(dry_run),
     }
@@ -1996,6 +2438,8 @@ def _process_normalized_row(
     result["media_downloaded"] += int(enrich.get("media_downloaded") or 0)
     result["transcribed"] += int(enrich.get("transcribed") or 0)
     result["images_described"] += int(enrich.get("images_described") or 0)
+    result["docs_analyzed"] += int(enrich.get("docs_analyzed") or 0)
+    result["pdf_skipped"] += int(enrich.get("pdf_skipped") or 0)
     result["media_deleted"] += int(enrich.get("media_deleted") or 0)
 
     action = upsert_message(conn, normalized)
