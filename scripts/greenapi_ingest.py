@@ -986,16 +986,107 @@ def normalize_notification(notification: dict[str, Any], media_url: str) -> dict
     }
 
 
-def _history_direction(event: dict[str, Any], direction_hint: str | None = None) -> str:
-    t = _first_non_empty(event.get("typeWebhook"), event.get("type"), event.get("eventType")).lower()
-    if t.startswith("out") or "outgoing" in t:
+def _normalize_direction_value(value: Any) -> str | None:
+    s = str(value or "").strip().lower()
+    if not s:
+        return None
+
+    direct_map = {
+        "out": "out",
+        "outgoing": "out",
+        "outbound": "out",
+        "sent": "out",
+        "send": "out",
+        "fromme": "out",
+        "from_me": "out",
+        "in": "in",
+        "incoming": "in",
+        "inbound": "in",
+        "received": "in",
+        "recv": "in",
+        "to_me": "in",
+    }
+    if s in direct_map:
+        return direct_map[s]
+
+    compact = re.sub(r"[^a-z0-9]+", "", s)
+    if not compact:
+        return None
+
+    if (
+        compact.startswith(("outgoing", "outbound", "messagesent", "sent"))
+        or "outgoing" in compact
+        or "outbound" in compact
+        or compact.endswith("sent")
+    ):
         return "out"
-    if t.startswith("in") or "incoming" in t:
+
+    if (
+        compact.startswith(("incoming", "inbound", "messagereceived", "received"))
+        or "incoming" in compact
+        or "inbound" in compact
+        or "received" in compact
+    ):
         return "in"
-    if _is_truthy(event.get("fromMe")):
-        return "out"
-    if str(direction_hint or "").strip().lower() in {"in", "out"}:
-        return str(direction_hint).strip().lower()
+
+    return None
+
+
+def _history_candidate_values(event: dict[str, Any]) -> list[Any]:
+    keys = (
+        "direction",
+        "messageDirection",
+        "chatDirection",
+        "folder",
+        "typeWebhook",
+        "type",
+        "eventType",
+        "event",
+        "status",
+        "statusMessage",
+        "messageType",
+        "typeMessage",
+    )
+
+    values: list[Any] = []
+    nodes: list[dict[str, Any]] = [event]
+    for nested_key in ("body", "payload", "messageData", "data"):
+        nested = event.get(nested_key)
+        if isinstance(nested, dict):
+            nodes.append(nested)
+
+    for node in nodes:
+        for k in keys:
+            if k in node:
+                values.append(node.get(k))
+
+    return values
+
+
+def _history_direction(event: dict[str, Any], direction_hint: str | None = None) -> str:
+    hint_dir = _normalize_direction_value(direction_hint)
+    if hint_dir in {"in", "out"}:
+        return hint_dir
+
+    from_me_false_seen = False
+    for node in [event, event.get("body"), event.get("payload"), event.get("messageData"), event.get("data")]:
+        if not isinstance(node, dict):
+            continue
+        for key in ("fromMe", "isFromMe", "from_me"):
+            if key not in node:
+                continue
+            if _is_truthy(node.get(key)):
+                return "out"
+            from_me_false_seen = True
+
+    for value in _history_candidate_values(event):
+        direction = _normalize_direction_value(value)
+        if direction in {"in", "out"}:
+            return direction
+
+    if from_me_false_seen:
+        return "in"
+
     return "in"
 
 
@@ -1195,7 +1286,11 @@ def upsert_message(conn: sqlite3.Connection, row: dict[str, Any]) -> str:
                 new_text = row.get("text")
 
             new_ts = old_ts or row.get("ts")
-            new_direction = old_direction or row.get("direction")
+            incoming_direction = str(row.get("direction") or "").strip().lower()
+            if incoming_direction in {"in", "out"}:
+                new_direction = incoming_direction
+            else:
+                new_direction = old_direction
             new_peer = old_peer if str(old_peer or "").strip() not in {"", "unknown"} else row.get("peer")
 
             if (

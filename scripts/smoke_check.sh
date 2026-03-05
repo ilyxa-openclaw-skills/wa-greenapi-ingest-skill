@@ -28,6 +28,9 @@ fi
 echo "[smoke] Python синтаксис"
 python3 -m py_compile "$INGEST_SCRIPT"
 
+echo "[smoke] history direction self-check"
+python3 "$ROOT_DIR/scripts/history_direction_selfcheck.py"
+
 echo "[smoke] Пробный прием 1 уведомления в dry-run (без записи в БД / media / transcript и без deleteNotification)"
 python3 "$INGEST_SCRIPT" ingest-once --dry-run --max-events 1 --verbose
 

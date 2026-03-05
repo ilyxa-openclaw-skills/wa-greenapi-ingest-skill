@@ -13,6 +13,10 @@
   - `history` → `lastOutgoingMessages` + `lastIncomingMessages`
   - `auto` (default) → сначала `queue`, если 0 событий — fallback на `history`
 - нормализует queue/history события в одну схему таблицы `messages`
+- history direction mapping (устойчиво к разным payload-полям):
+  - `lastOutgoingMessages` -> `direction=out`
+  - `lastIncomingMessages` -> `direction=in`
+  - приоритет: endpoint hint (`direction_hint`) → поля `direction/type/typeWebhook/eventType/...` → `fromMe=true`
 - помечает источник в `source_type`:
   - queue: `greenapi`
   - history: `greenapi-history`
@@ -37,6 +41,7 @@
 ├── README.md
 └── scripts
     ├── greenapi_ingest.py
+    ├── history_direction_selfcheck.py
     ├── smoke_check.sh
     └── verify_media_transcript.sh
 ```
@@ -69,6 +74,7 @@ export OPENAI_API_KEY=...
 
 Smoke проверяет:
 - синтаксис Python
+- self-check direction mapping для history payload (`scripts/history_direction_selfcheck.py`)
 - dry-run ingest 1 события
 - наличие verify-скрипта
 
@@ -85,6 +91,38 @@ Smoke проверяет:
   - `GET /waInstance{idInstance}/lastOutgoingMessages/{token}`
   - `GET /waInstance{idInstance}/lastIncomingMessages/{token}`
 - `auto` (default) — сначала queue, если `received=0`, то history
+
+### History direction mapping и одноразовый repair старых записей
+
+Начиная с текущего фикса:
+- `lastOutgoingMessages` нормализуется в `direction=out`
+- `lastIncomingMessages` нормализуется в `direction=in`
+
+Если в БД уже есть старые записи `greenapi-history` с `direction=in` для outgoing-history (из-за старого бага + дедупа), можно выполнить безопасный одноразовый repair только для очевидных кейсов (`historyDirectionHint='out'`):
+
+```bash
+sqlite3 /home/openclaw/.openclaw/workspace/wa_archive.db "
+UPDATE messages
+SET direction='out'
+WHERE source_type='greenapi-history'
+  AND direction='in'
+  AND json_extract(raw_json, '$.waArchiveIngestDiag.historyDirectionHint')='out';
+"
+```
+
+Проверка перед/после:
+
+```bash
+sqlite3 /home/openclaw/.openclaw/workspace/wa_archive.db "
+SELECT direction,
+       json_extract(raw_json, '$.waArchiveIngestDiag.historyDirectionHint') AS hint,
+       COUNT(*)
+FROM messages
+WHERE source_type='greenapi-history'
+GROUP BY direction, hint
+ORDER BY hint, direction;
+"
+```
 
 ---
 
