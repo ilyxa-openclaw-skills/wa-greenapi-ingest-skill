@@ -27,7 +27,7 @@ rows = conn.execute(
     """
     SELECT id, ts, peer, text, raw_json
     FROM messages
-    WHERE source_type='greenapi'
+    WHERE source_type IN ('greenapi','greenapi-history')
     ORDER BY id DESC
     LIMIT ?
     """,

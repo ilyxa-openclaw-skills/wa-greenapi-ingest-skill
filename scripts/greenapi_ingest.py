@@ -45,6 +45,13 @@ DEFAULT_TRANSCRIBE_MODEL = str(os.getenv("GREENAPI_TRANSCRIBE_MODEL", "whisper-1
 DEFAULT_TRANSCRIBE_LANGUAGE = str(os.getenv("GREENAPI_TRANSCRIBE_LANGUAGE", "")).strip() or None
 DEFAULT_HTTP_TIMEOUT = int(os.getenv("GREENAPI_HTTP_TIMEOUT_SEC", "45"))
 
+SOURCE_QUEUE = "queue"
+SOURCE_HISTORY = "history"
+SOURCE_AUTO = "auto"
+
+SOURCE_TYPE_QUEUE = "greenapi"
+SOURCE_TYPE_HISTORY = "greenapi-history"
+
 URL_KEY_CANDIDATES = {
     "downloadurl",
     "urlfile",
@@ -312,6 +319,36 @@ class GreenApiClient:
         if data is None:
             return []
         return _collect_candidate_refs(data)
+
+    def _extract_history_items(self, data: Any) -> list[dict[str, Any]]:
+        if isinstance(data, list):
+            return [x for x in data if isinstance(x, dict)]
+        if isinstance(data, dict):
+            for key in ("messages", "data", "items", "result", "list"):
+                v = data.get(key)
+                if isinstance(v, list):
+                    return [x for x in v if isinstance(x, dict)]
+            if any(k in data for k in ("idMessage", "timestamp", "typeMessage", "chatId")):
+                return [data]
+        return []
+
+    def last_outgoing_messages(self) -> list[dict[str, Any]]:
+        url = f"{self.api_url}/waInstance{self.id_instance}/lastOutgoingMessages/{self.api_token}"
+        data = self._request_json("GET", url, quiet_errors=True)
+        return self._extract_history_items(data)
+
+    def last_incoming_messages(self) -> list[dict[str, Any]]:
+        url = f"{self.api_url}/waInstance{self.id_instance}/lastIncomingMessages/{self.api_token}"
+        data = self._request_json("GET", url, quiet_errors=True)
+        return self._extract_history_items(data)
+
+    def fetch_history_messages(self) -> list[dict[str, Any]]:
+        merged: list[dict[str, Any]] = []
+        for item in self.last_outgoing_messages():
+            merged.append({"direction_hint": "out", "event": item})
+        for item in self.last_incoming_messages():
+            merged.append({"direction_hint": "in", "event": item})
+        return merged
 
 
 class SinceFilter:
@@ -942,7 +979,177 @@ def normalize_notification(notification: dict[str, Any], media_url: str) -> dict
         "raw_obj": raw_obj,
         "raw_json": json.dumps(raw_obj, ensure_ascii=False),
         "source_line": source_line[:2000],
-        "source_type": "greenapi",
+        "source_type": SOURCE_TYPE_QUEUE,
+        "source_message_id": source_message_id,
+        "_payload": payload,
+        "_media_meta": media_meta,
+    }
+
+
+def _history_direction(event: dict[str, Any], direction_hint: str | None = None) -> str:
+    t = _first_non_empty(event.get("typeWebhook"), event.get("type"), event.get("eventType")).lower()
+    if t.startswith("out") or "outgoing" in t:
+        return "out"
+    if t.startswith("in") or "incoming" in t:
+        return "in"
+    if _is_truthy(event.get("fromMe")):
+        return "out"
+    if str(direction_hint or "").strip().lower() in {"in", "out"}:
+        return str(direction_hint).strip().lower()
+    return "in"
+
+
+def _history_timestamp_raw(event: dict[str, Any]) -> Any:
+    return _first_non_empty(
+        event.get("timestamp"),
+        event.get("timestampSend"),
+        event.get("time"),
+        event.get("createdAt"),
+        event.get("created"),
+        event.get("date"),
+    )
+
+
+def _history_sort_key(item: dict[str, Any]) -> tuple[float, str]:
+    event = item.get("event") if isinstance(item.get("event"), dict) else {}
+    ts_raw = _history_timestamp_raw(event)
+    epoch = _iso_to_epoch(ts_raw)
+    if epoch is None:
+        epoch = 0.0
+    msg_id = _first_non_empty(event.get("idMessage"), event.get("id"), event.get("stanzaId"))
+    return (epoch, msg_id)
+
+
+def _build_history_payload(event: dict[str, Any], direction: str) -> dict[str, Any]:
+    type_message = _first_non_empty(event.get("typeMessage"), event.get("messageType"), event.get("type"))
+
+    chat_id = _first_non_empty(event.get("chatId"), event.get("senderId"), event.get("recipientId"))
+    sender_id = _first_non_empty(event.get("senderId"), event.get("sender"), event.get("from"))
+    recipient_id = _first_non_empty(event.get("recipientId"), event.get("recipient"), event.get("to"), chat_id)
+
+    text = _first_non_empty(
+        event.get("textMessage"),
+        event.get("text"),
+        event.get("message"),
+        ((event.get("textMessageData") or {}).get("textMessage") if isinstance(event.get("textMessageData"), dict) else ""),
+    )
+    caption = _first_non_empty(event.get("caption"), event.get("fileCaption"))
+
+    payload: dict[str, Any] = {
+        "typeWebhook": "outgoingMessageReceived" if direction == "out" else "incomingMessageReceived",
+        "timestamp": _history_timestamp_raw(event),
+        "idMessage": _first_non_empty(event.get("idMessage"), event.get("id"), event.get("stanzaId")),
+        "chatId": chat_id,
+        "fromMe": direction == "out",
+        "message": text or caption,
+        "senderData": {
+            "chatId": sender_id if direction == "in" else chat_id,
+            "sender": sender_id,
+        },
+        "recipientData": {
+            "chatId": recipient_id if direction == "out" else chat_id,
+            "recipient": recipient_id,
+        },
+        "messageData": {
+            "typeMessage": type_message,
+        },
+    }
+
+    md = payload["messageData"]
+    if text:
+        md["textMessageData"] = {"textMessage": text}
+    elif caption:
+        md["extendedTextMessageData"] = {"text": caption}
+
+    media_block: dict[str, Any] = {}
+    for key in (
+        "downloadUrl",
+        "urlFile",
+        "fileUrl",
+        "filePath",
+        "downloadPath",
+        "path",
+        "directPath",
+        "url",
+        "mediaUrl",
+    ):
+        value = event.get(key)
+        if isinstance(value, str) and value.strip():
+            media_block[key] = value.strip()
+
+    file_name = _first_non_empty(event.get("fileName"), event.get("name"))
+    if file_name:
+        media_block["fileName"] = file_name
+
+    mime_type = _first_non_empty(event.get("mimeType"), event.get("mime"), event.get("fileMimeType"))
+    if mime_type:
+        media_block["mimeType"] = mime_type
+
+    ptt = event.get("ptt")
+    if ptt is not None:
+        media_block["ptt"] = ptt
+
+    type_lc = str(type_message or "").strip().lower()
+    is_audio_like = "audio" in type_lc or "voice" in type_lc or "ptt" in type_lc or str(mime_type).lower().startswith("audio/")
+
+    if media_block:
+        if is_audio_like:
+            md["audioMessageData"] = dict(media_block)
+        else:
+            md["fileMessageData"] = dict(media_block)
+
+        for key, value in media_block.items():
+            payload.setdefault(key, value)
+
+    return payload
+
+
+def normalize_history_event(
+    history_event: dict[str, Any],
+    media_url: str,
+    direction_hint: str | None = None,
+) -> dict[str, Any] | None:
+    if not isinstance(history_event, dict):
+        return None
+
+    direction = _history_direction(history_event, direction_hint=direction_hint)
+    payload = _build_history_payload(history_event, direction=direction)
+
+    type_webhook = str(payload.get("typeWebhook") or "").strip()
+    source_message_id = _extract_source_message_id(payload)
+    ts = _ts_to_iso(payload.get("timestamp"))
+    peer = _extract_peer(payload, direction)
+
+    text, media_meta = _extract_text_and_media_flags(payload)
+    if not text:
+        return None
+
+    raw_obj = {
+        "greenapi": {
+            "history": history_event,
+        },
+        "waArchiveIngestDiag": {
+            "pipeline": "greenapi_ingest.py",
+            "phase": "phase2",
+            "source": "greenapi_history",
+            "typeWebhook": type_webhook,
+            "directionInferred": direction,
+            "mediaUrlConfigured": bool(media_url),
+            "historyDirectionHint": direction_hint,
+            **media_meta,
+        },
+    }
+
+    source_line = json.dumps(history_event, ensure_ascii=False)
+    return {
+        "ts": ts,
+        "direction": direction,
+        "peer": peer,
+        "text": text,
+        "raw_obj": raw_obj,
+        "raw_json": json.dumps(raw_obj, ensure_ascii=False),
+        "source_line": source_line[:2000],
+        "source_type": SOURCE_TYPE_HISTORY,
         "source_message_id": source_message_id,
         "_payload": payload,
         "_media_meta": media_meta,
@@ -966,21 +1173,22 @@ def _should_replace_text(existing_text: str, incoming_text: str) -> bool:
 
 
 def upsert_message(conn: sqlite3.Connection, row: dict[str, Any]) -> str:
-    source_type = row.get("source_type") or "greenapi"
+    source_type = row.get("source_type") or SOURCE_TYPE_QUEUE
     source_message_id = str(row.get("source_message_id") or "").strip()
 
     if source_message_id:
         existing = conn.execute(
             """
-            SELECT id, ts, direction, peer, text
+            SELECT id, source_type, ts, direction, peer, text
             FROM messages
-            WHERE source_type=? AND source_message_id=?
-            ORDER BY id ASC LIMIT 1
+            WHERE source_message_id=?
+            ORDER BY CASE WHEN source_type=? THEN 0 ELSE 1 END, id ASC
+            LIMIT 1
             """,
-            (source_type, source_message_id),
+            (source_message_id, source_type),
         ).fetchone()
         if existing:
-            row_id, old_ts, old_direction, old_peer, old_text = existing
+            row_id, old_source_type, old_ts, old_direction, old_peer, old_text = existing
 
             new_text = old_text
             if _should_replace_text(str(old_text or ""), str(row.get("text") or "")):
@@ -999,7 +1207,7 @@ def upsert_message(conn: sqlite3.Connection, row: dict[str, Any]) -> str:
                 conn.execute(
                     """
                     UPDATE messages
-                    SET ts=?, direction=?, peer=?, text=?, raw_json=?, source_line=?
+                    SET ts=?, direction=?, peer=?, text=?, raw_json=?, source_line=?, source_message_id=?
                     WHERE id=?
                     """,
                     (
@@ -1009,9 +1217,17 @@ def upsert_message(conn: sqlite3.Connection, row: dict[str, Any]) -> str:
                         new_text,
                         row.get("raw_json"),
                         row.get("source_line"),
+                        source_message_id,
                         row_id,
                     ),
                 )
+                if old_source_type != source_type:
+                    logging.debug(
+                        "Dedup hit: source_message_id=%s existing_source=%s incoming_source=%s",
+                        source_message_id,
+                        old_source_type,
+                        source_type,
+                    )
                 return "updated"
             return "duplicate"
 
@@ -1118,7 +1334,75 @@ def _enrich_media_and_transcript(
     return result
 
 
-def ingest_once(
+def _empty_stats(dry_run: bool) -> dict[str, Any]:
+    return {
+        "received": 0,
+        "inserted": 0,
+        "updated": 0,
+        "skipped": 0,
+        "skipped_since": 0,
+        "deleted": 0,
+        "errors": 0,
+        "media_downloaded": 0,
+        "transcribed": 0,
+        "dry_run": bool(dry_run),
+    }
+
+
+def _process_normalized_row(
+    *,
+    client: GreenApiClient,
+    conn: sqlite3.Connection | None,
+    result: dict[str, Any],
+    normalized: dict[str, Any] | None,
+    dry_run: bool,
+    media_dir: Path,
+    transcribe_audio: bool,
+    transcribe_model: str,
+    transcribe_language: str | None,
+    since_filter: SinceFilter | None,
+) -> None:
+    if normalized is None:
+        result["skipped"] += 1
+        return
+
+    if since_filter is not None and not since_filter.allow(normalized):
+        result["skipped_since"] += 1
+        return
+
+    if dry_run:
+        result["inserted"] += 1
+        logging.info(
+            "[dry-run] normalized: id=%s direction=%s peer=%s text=%s",
+            normalized.get("source_message_id"),
+            normalized.get("direction"),
+            normalized.get("peer"),
+            str(normalized.get("text") or "")[:120],
+        )
+        return
+
+    assert conn is not None
+    enrich = _enrich_media_and_transcript(
+        client=client,
+        row=normalized,
+        media_dir=media_dir,
+        transcribe_audio=bool(transcribe_audio),
+        transcribe_model=transcribe_model,
+        transcribe_language=transcribe_language,
+    )
+    result["media_downloaded"] += int(enrich.get("media_downloaded") or 0)
+    result["transcribed"] += int(enrich.get("transcribed") or 0)
+
+    action = upsert_message(conn, normalized)
+    if action == "inserted":
+        result["inserted"] += 1
+    elif action == "updated":
+        result["updated"] += 1
+    else:
+        result["skipped"] += 1
+
+
+def ingest_queue_once(
     client: GreenApiClient,
     db_path: Path,
     state_path: Path,
@@ -1131,18 +1415,7 @@ def ingest_once(
     since_filter: SinceFilter | None = None,
 ) -> dict[str, Any]:
     state = _load_json(state_path, default={})
-    result = {
-        "received": 0,
-        "inserted": 0,
-        "updated": 0,
-        "skipped": 0,
-        "skipped_since": 0,
-        "deleted": 0,
-        "errors": 0,
-        "media_downloaded": 0,
-        "transcribed": 0,
-        "dry_run": bool(dry_run),
-    }
+    result = _empty_stats(dry_run)
 
     conn: sqlite3.Connection | None = None
     try:
@@ -1158,41 +1431,21 @@ def ingest_once(
 
         try:
             normalized = normalize_notification(event, media_url=client.media_url)
-            if normalized is None:
-                result["skipped"] += 1
-            elif since_filter is not None and not since_filter.allow(normalized):
-                result["skipped_since"] += 1
-            elif dry_run:
-                result["inserted"] += 1
-                logging.info(
-                    "[dry-run] normalized: id=%s direction=%s peer=%s text=%s",
-                    normalized.get("source_message_id"),
-                    normalized.get("direction"),
-                    normalized.get("peer"),
-                    str(normalized.get("text") or "")[:120],
-                )
-            else:
-                enrich = _enrich_media_and_transcript(
-                    client=client,
-                    row=normalized,
-                    media_dir=media_dir,
-                    transcribe_audio=bool(transcribe_audio),
-                    transcribe_model=transcribe_model,
-                    transcribe_language=transcribe_language,
-                )
-                result["media_downloaded"] += int(enrich.get("media_downloaded") or 0)
-                result["transcribed"] += int(enrich.get("transcribed") or 0)
-
-                action = upsert_message(conn, normalized)
-                if action == "inserted":
-                    result["inserted"] += 1
-                elif action == "updated":
-                    result["updated"] += 1
-                else:
-                    result["skipped"] += 1
+            _process_normalized_row(
+                client=client,
+                conn=conn,
+                result=result,
+                normalized=normalized,
+                dry_run=dry_run,
+                media_dir=media_dir,
+                transcribe_audio=transcribe_audio,
+                transcribe_model=transcribe_model,
+                transcribe_language=transcribe_language,
+                since_filter=since_filter,
+            )
         except Exception:
             result["errors"] += 1
-            logging.exception("Ошибка обработки уведомления")
+            logging.exception("Ошибка обработки queue-уведомления")
 
         # Важно: dry-run не должен удалять queue-событие.
         if receipt_id is not None and not dry_run:
@@ -1203,6 +1456,7 @@ def ingest_once(
 
         state["last_run_utc"] = dt.datetime.now(tz=dt.timezone.utc).isoformat()
         state["last_receipt_id"] = event.get("receiptId") if isinstance(event, dict) else None
+        state["last_source_mode"] = SOURCE_QUEUE
         if since_filter is not None:
             state["since_filter"] = since_filter.describe()
         _save_json(state_path, state)
@@ -1214,6 +1468,155 @@ def ingest_once(
     finally:
         if conn is not None:
             conn.close()
+
+
+def ingest_history_once(
+    client: GreenApiClient,
+    db_path: Path,
+    state_path: Path,
+    media_dir: Path,
+    dry_run: bool = False,
+    transcribe_audio: bool = True,
+    transcribe_model: str = DEFAULT_TRANSCRIBE_MODEL,
+    transcribe_language: str | None = DEFAULT_TRANSCRIBE_LANGUAGE,
+    since_filter: SinceFilter | None = None,
+    max_events: int = 50,
+) -> dict[str, Any]:
+    state = _load_json(state_path, default={})
+    result = _empty_stats(dry_run)
+
+    wrapped_events = client.fetch_history_messages()
+    if not wrapped_events:
+        return result
+
+    wrapped_events = sorted(wrapped_events, key=_history_sort_key)
+    limit = max(1, int(max_events))
+    wrapped_events = wrapped_events[-limit:]
+
+    result["received"] = len(wrapped_events)
+
+    conn: sqlite3.Connection | None = None
+    try:
+        if not dry_run:
+            conn = ensure_db(db_path)
+
+        for item in wrapped_events:
+            event = item.get("event") if isinstance(item.get("event"), dict) else {}
+            direction_hint = item.get("direction_hint")
+            try:
+                normalized = normalize_history_event(
+                    event,
+                    media_url=client.media_url,
+                    direction_hint=str(direction_hint or "") or None,
+                )
+                _process_normalized_row(
+                    client=client,
+                    conn=conn,
+                    result=result,
+                    normalized=normalized,
+                    dry_run=dry_run,
+                    media_dir=media_dir,
+                    transcribe_audio=transcribe_audio,
+                    transcribe_model=transcribe_model,
+                    transcribe_language=transcribe_language,
+                    since_filter=since_filter,
+                )
+            except Exception:
+                result["errors"] += 1
+                logging.exception("Ошибка обработки history-сообщения")
+
+        state["last_run_utc"] = dt.datetime.now(tz=dt.timezone.utc).isoformat()
+        state["last_history_received"] = len(wrapped_events)
+        state["last_source_mode"] = SOURCE_HISTORY
+        if wrapped_events:
+            last_event = wrapped_events[-1].get("event") if isinstance(wrapped_events[-1].get("event"), dict) else {}
+            state["last_history_message_id"] = _first_non_empty(last_event.get("idMessage"), last_event.get("id"), last_event.get("stanzaId"))
+        if since_filter is not None:
+            state["since_filter"] = since_filter.describe()
+        _save_json(state_path, state)
+
+        if conn is not None:
+            conn.commit()
+
+        return result
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def ingest_once_by_source(
+    client: GreenApiClient,
+    db_path: Path,
+    state_path: Path,
+    receive_timeout: int,
+    media_dir: Path,
+    dry_run: bool,
+    transcribe_audio: bool,
+    transcribe_model: str,
+    transcribe_language: str | None,
+    since_filter: SinceFilter | None,
+    source: str,
+    max_history_events: int,
+) -> dict[str, Any]:
+    source_mode = str(source or SOURCE_AUTO).strip().lower()
+
+    if source_mode == SOURCE_QUEUE:
+        return ingest_queue_once(
+            client=client,
+            db_path=db_path,
+            state_path=state_path,
+            receive_timeout=receive_timeout,
+            media_dir=media_dir,
+            dry_run=dry_run,
+            transcribe_audio=transcribe_audio,
+            transcribe_model=transcribe_model,
+            transcribe_language=transcribe_language,
+            since_filter=since_filter,
+        )
+
+    if source_mode == SOURCE_HISTORY:
+        return ingest_history_once(
+            client=client,
+            db_path=db_path,
+            state_path=state_path,
+            media_dir=media_dir,
+            dry_run=dry_run,
+            transcribe_audio=transcribe_audio,
+            transcribe_model=transcribe_model,
+            transcribe_language=transcribe_language,
+            since_filter=since_filter,
+            max_events=max_history_events,
+        )
+
+    queue_stats = ingest_queue_once(
+        client=client,
+        db_path=db_path,
+        state_path=state_path,
+        receive_timeout=receive_timeout,
+        media_dir=media_dir,
+        dry_run=dry_run,
+        transcribe_audio=transcribe_audio,
+        transcribe_model=transcribe_model,
+        transcribe_language=transcribe_language,
+        since_filter=since_filter,
+    )
+
+    if int(queue_stats.get("received") or 0) > 0:
+        return queue_stats
+
+    return ingest_history_once(
+        client=client,
+        db_path=db_path,
+        state_path=state_path,
+        media_dir=media_dir,
+        dry_run=dry_run,
+        transcribe_audio=transcribe_audio,
+        transcribe_model=transcribe_model,
+        transcribe_language=transcribe_language,
+        since_filter=since_filter,
+        max_events=max_history_events,
+    )
+
 
 
 def _merge_stats(dst: dict[str, Any], src: dict[str, Any]) -> None:
@@ -1236,23 +1639,29 @@ def ingest_batch(
     transcribe_language: str | None,
     since_filter: SinceFilter | None,
     max_events: int,
+    source: str = SOURCE_AUTO,
 ) -> dict[str, Any]:
     n = max(1, int(max_events))
-    agg = {
-        "received": 0,
-        "inserted": 0,
-        "updated": 0,
-        "skipped": 0,
-        "skipped_since": 0,
-        "deleted": 0,
-        "errors": 0,
-        "media_downloaded": 0,
-        "transcribed": 0,
-        "dry_run": bool(dry_run),
-    }
+    source_mode = str(source or SOURCE_AUTO).strip().lower()
+
+    agg = _empty_stats(dry_run)
+
+    if source_mode == SOURCE_HISTORY:
+        return ingest_history_once(
+            client=client,
+            db_path=db_path,
+            state_path=state_path,
+            media_dir=media_dir,
+            dry_run=dry_run,
+            transcribe_audio=transcribe_audio,
+            transcribe_model=transcribe_model,
+            transcribe_language=transcribe_language,
+            since_filter=since_filter,
+            max_events=n,
+        )
 
     for _ in range(n):
-        stats = ingest_once(
+        stats = ingest_queue_once(
             client=client,
             db_path=db_path,
             state_path=state_path,
@@ -1270,7 +1679,23 @@ def ingest_batch(
         if int(stats.get("received") or 0) == 0:
             break
 
+    if source_mode == SOURCE_AUTO and int(agg.get("received") or 0) == 0:
+        hist = ingest_history_once(
+            client=client,
+            db_path=db_path,
+            state_path=state_path,
+            media_dir=media_dir,
+            dry_run=dry_run,
+            transcribe_audio=transcribe_audio,
+            transcribe_model=transcribe_model,
+            transcribe_language=transcribe_language,
+            since_filter=since_filter,
+            max_events=n,
+        )
+        _merge_stats(agg, hist)
+
     return agg
+
 
 
 def run_loop(
@@ -1287,9 +1712,12 @@ def run_loop(
     transcribe_model: str,
     transcribe_language: str | None,
     since_filter: SinceFilter | None,
+    source: str = SOURCE_AUTO,
 ) -> None:
     i = 0
     total_received = 0
+    source_mode = str(source or SOURCE_AUTO).strip().lower()
+    history_fallback_ready = True
 
     while True:
         if max_events > 0 and total_received >= max_events:
@@ -1298,18 +1726,68 @@ def run_loop(
 
         i += 1
         try:
-            stats = ingest_once(
-                client=client,
-                db_path=db_path,
-                state_path=state_path,
-                receive_timeout=receive_timeout,
-                media_dir=media_dir,
-                dry_run=dry_run,
-                transcribe_audio=transcribe_audio,
-                transcribe_model=transcribe_model,
-                transcribe_language=transcribe_language,
-                since_filter=since_filter,
-            )
+            remaining = (max_events - total_received) if max_events > 0 else 50
+            history_limit = max(1, int(remaining))
+
+            if source_mode == SOURCE_QUEUE:
+                stats = ingest_queue_once(
+                    client=client,
+                    db_path=db_path,
+                    state_path=state_path,
+                    receive_timeout=receive_timeout,
+                    media_dir=media_dir,
+                    dry_run=dry_run,
+                    transcribe_audio=transcribe_audio,
+                    transcribe_model=transcribe_model,
+                    transcribe_language=transcribe_language,
+                    since_filter=since_filter,
+                )
+            elif source_mode == SOURCE_HISTORY:
+                stats = ingest_history_once(
+                    client=client,
+                    db_path=db_path,
+                    state_path=state_path,
+                    media_dir=media_dir,
+                    dry_run=dry_run,
+                    transcribe_audio=transcribe_audio,
+                    transcribe_model=transcribe_model,
+                    transcribe_language=transcribe_language,
+                    since_filter=since_filter,
+                    max_events=history_limit,
+                )
+            else:
+                queue_stats = ingest_queue_once(
+                    client=client,
+                    db_path=db_path,
+                    state_path=state_path,
+                    receive_timeout=receive_timeout,
+                    media_dir=media_dir,
+                    dry_run=dry_run,
+                    transcribe_audio=transcribe_audio,
+                    transcribe_model=transcribe_model,
+                    transcribe_language=transcribe_language,
+                    since_filter=since_filter,
+                )
+                if int(queue_stats.get("received") or 0) > 0:
+                    stats = queue_stats
+                    history_fallback_ready = True
+                elif history_fallback_ready:
+                    stats = ingest_history_once(
+                        client=client,
+                        db_path=db_path,
+                        state_path=state_path,
+                        media_dir=media_dir,
+                        dry_run=dry_run,
+                        transcribe_audio=transcribe_audio,
+                        transcribe_model=transcribe_model,
+                        transcribe_language=transcribe_language,
+                        since_filter=since_filter,
+                        max_events=history_limit,
+                    )
+                    history_fallback_ready = False
+                else:
+                    stats = queue_stats
+
             total_received += int(stats.get("received") or 0)
             logging.info("cycle=%s total_received=%s stats=%s", i, total_received, json.dumps(stats, ensure_ascii=False))
         except KeyboardInterrupt:
@@ -1323,6 +1801,7 @@ def run_loop(
 
         if poll_sleep_sec > 0:
             time.sleep(poll_sleep_sec)
+
 
 
 def _build_client_from_env() -> GreenApiClient:
@@ -1370,7 +1849,13 @@ def main() -> None:
         "--max-events",
         type=int,
         default=None,
-        help="Максимум принятых queue-событий за запуск (ingest-once: default 1, run: default 0=без лимита)",
+        help="Максимум событий за запуск (queue/history; ingest-once: default 1, run: default 0=без лимита)",
+    )
+    common.add_argument(
+        "--source",
+        choices=[SOURCE_QUEUE, SOURCE_HISTORY, SOURCE_AUTO],
+        default=SOURCE_AUTO,
+        help="Источник событий: queue | history | auto (auto: сначала queue, если 0 — history)",
     )
     common.add_argument(
         "--since",
@@ -1415,6 +1900,7 @@ def main() -> None:
             transcribe_language=str(args.transcribe_language or "").strip() or None,
             since_filter=since_filter,
             max_events=max(1, int(args.max_events if args.max_events is not None else 1)),
+            source=str(args.source or SOURCE_AUTO).strip().lower(),
         )
         print(json.dumps(stats, ensure_ascii=False))
         return
@@ -1434,6 +1920,7 @@ def main() -> None:
             transcribe_model=str(args.transcribe_model or "whisper-1"),
             transcribe_language=str(args.transcribe_language or "").strip() or None,
             since_filter=since_filter,
+            source=str(args.source or SOURCE_AUTO).strip().lower(),
         )
 
 
