@@ -24,8 +24,12 @@
 
 ### Image
 - временно скачивает image
-- делает описание содержимого (vision)
-- сохраняет в `messages.text` финальный текст (для поиска/эмбеддингов)
+- делает описание содержимого через настраиваемый backend:
+  - `GREENAPI_IMAGE_DESCRIBE_BACKEND=auto` (default): **OpenClaw gateway** -> OpenAI
+  - `GREENAPI_IMAGE_DESCRIBE_BACKEND=openclaw`: только OpenClaw
+  - `GREENAPI_IMAGE_DESCRIBE_BACKEND=openai`: только OpenAI
+- при успехе сохраняет в `messages.text` нормальный description-текст (без meta-prefix)
+- при ошибке backend **не** пишет meta-fallback в `text`; ставит только `[image description failed]` и `raw_json.waArchiveIngestDiag.imageDescription.pending_reprocess=true`
 - удаляет локальный файл при `GREENAPI_KEEP_MEDIA_FILES=0`
 
 ### Audio/Voice
@@ -44,7 +48,7 @@
 - `mediaDownload`
 - `mediaStorage` (в т.ч. `binaryDeleted` / `binaryStored` / `pathExistsAfterProcessing`)
 - `transcription` (для audio)
-- `imageDescription` (для image)
+- `imageDescription` (для image, включая `pending_reprocess` при ошибке describe)
 
 ---
 
@@ -71,10 +75,19 @@ cp .env.example .env
 # заполни .env
 ```
 
-Если нужен OpenAI-транскриб/vision:
+Если нужен OpenAI-транскриб/vision (fallback или backend=openai):
 
 ```bash
 export OPENAI_API_KEY=...
+```
+
+Для OpenClaw-native image describe (без отдельного OpenAI key для картинок):
+
+```bash
+export OPENCLAW_GATEWAY_URL=http://127.0.0.1:18789
+# auth: укажи либо password, либо token (в зависимости от gateway.auth.mode)
+export OPENCLAW_GATEWAY_PASSWORD=...
+# export OPENCLAW_GATEWAY_TOKEN=...
 ```
 
 ---
@@ -82,9 +95,13 @@ export OPENAI_API_KEY=...
 ## Ключевые env
 
 ```bash
-GREENAPI_KEEP_MEDIA_FILES=0     # default: удалять временные файлы
-GREENAPI_DESCRIBE_IMAGES=1      # default: включено
-GREENAPI_TRANSCRIBE_AUDIO=1     # default: включено
+GREENAPI_KEEP_MEDIA_FILES=0                # default: удалять временные файлы
+GREENAPI_DESCRIBE_IMAGES=1                 # default: включено
+GREENAPI_TRANSCRIBE_AUDIO=1                # default: включено
+GREENAPI_IMAGE_DESCRIBE_BACKEND=auto       # auto|openclaw|openai
+OPENCLAW_GATEWAY_URL=http://127.0.0.1:18789
+OPENCLAW_GATEWAY_PASSWORD=
+OPENCLAW_GATEWAY_TOKEN=
 ```
 
 Дополнительно:
@@ -103,9 +120,16 @@ GREENAPI_TRANSCRIBE_LANGUAGE=
 ./scripts/smoke_check.sh
 ```
 
+Отдельный mini-test backend failure handling:
+
+```bash
+python3 scripts/minitest_openclaw_image_backend.py
+```
+
 Smoke проверяет:
 - синтаксис Python
 - self-check direction mapping (`scripts/history_direction_selfcheck.py`)
+- minitest OpenClaw image backend: при недоступном gateway нет meta-fallback и ставится marker failed
 - dry-run ingest 1 события
 - наличие verify-скрипта
 

@@ -55,6 +55,11 @@ DEFAULT_TRANSCRIBE_AUDIO = str(os.getenv("GREENAPI_TRANSCRIBE_AUDIO", "1")).stri
     "y",
 }
 DEFAULT_DESCRIBE_MODEL = str(os.getenv("GREENAPI_DESCRIBE_MODEL", "gpt-4o-mini")).strip() or "gpt-4o-mini"
+DEFAULT_IMAGE_DESCRIBE_BACKEND = str(os.getenv("GREENAPI_IMAGE_DESCRIBE_BACKEND", "auto")).strip().lower() or "auto"
+DEFAULT_OPENCLAW_GATEWAY_URL = str(os.getenv("OPENCLAW_GATEWAY_URL", "http://127.0.0.1:18789")).strip() or "http://127.0.0.1:18789"
+DEFAULT_OPENCLAW_GATEWAY_PASSWORD = str(os.getenv("OPENCLAW_GATEWAY_PASSWORD", "")).strip()
+DEFAULT_OPENCLAW_GATEWAY_TOKEN = str(os.getenv("OPENCLAW_GATEWAY_TOKEN", "")).strip()
+DEFAULT_OPENCLAW_DESCRIBE_TIMEOUT = int(os.getenv("OPENCLAW_IMAGE_DESCRIBE_TIMEOUT_SEC", "120"))
 DEFAULT_TRANSCRIBE_MODEL = str(os.getenv("GREENAPI_TRANSCRIBE_MODEL", "whisper-1")).strip() or "whisper-1"
 DEFAULT_TRANSCRIBE_LANGUAGE = str(os.getenv("GREENAPI_TRANSCRIBE_LANGUAGE", "")).strip() or None
 DEFAULT_HTTP_TIMEOUT = int(os.getenv("GREENAPI_HTTP_TIMEOUT_SEC", "45"))
@@ -984,6 +989,16 @@ def _build_media_meta_text(meta: dict[str, Any], suffix: str = "") -> str:
     return " ".join(p for p in parts if p)
 
 
+def _is_media_placeholder_text(text: str) -> bool:
+    t = str(text or "").strip()
+    return bool(t and t.startswith("<media:") and t.endswith(">"))
+
+
+def _set_image_description_failed_text(row: dict[str, Any], marker: str = "[image description failed]") -> None:
+    normalized_marker = str(marker or "").strip() or "[image description failed]"
+    row["text"] = normalized_marker
+
+
 def _cleanup_downloaded_file(path_raw: str) -> tuple[bool, str]:
     raw = str(path_raw or "").strip()
     if not raw:
@@ -996,6 +1011,186 @@ def _cleanup_downloaded_file(path_raw: str) -> tuple[bool, str]:
         return True, "deleted"
     except Exception as e:
         return False, f"unlink failed: {e}"
+
+
+def _normalize_image_describe_backend(raw: str | None) -> str:
+    mode = str(raw or "").strip().lower()
+    if mode in {"openclaw", "openai", "auto"}:
+        return mode
+    return "auto"
+
+
+def _looks_like_image_not_seen_response(text: str) -> bool:
+    s = str(text or "").strip().lower()
+    if not s:
+        return True
+
+    if "не вижу" in s and "изображ" in s:
+        return True
+    if "пришли" in s and ("фото" in s or "изображ" in s):
+        return True
+
+    markers = (
+        "не могу увидеть изображ",
+        "не могу просмотреть изображ",
+        "изображение не",
+        "can't see",
+        "cannot see",
+        "cannot view",
+        "no image",
+        "image not provided",
+        "image was not provided",
+        "send the image",
+    )
+    return any(m in s for m in markers)
+
+
+def _gateway_auth_candidates(password: str | None = None, token: str | None = None) -> list[tuple[str, str]]:
+    out: list[tuple[str, str]] = []
+
+    p = str(password if password is not None else DEFAULT_OPENCLAW_GATEWAY_PASSWORD).strip()
+    t = str(token if token is not None else DEFAULT_OPENCLAW_GATEWAY_TOKEN).strip()
+
+    if p:
+        out.append(("password", p))
+    if t and t != p:
+        out.append(("token", t))
+
+    out.append(("none", ""))
+    return out
+
+
+def _openclaw_chat_completions_text(
+    payload: dict[str, Any],
+    gateway_url: str = DEFAULT_OPENCLAW_GATEWAY_URL,
+    timeout_sec: int = DEFAULT_OPENCLAW_DESCRIBE_TIMEOUT,
+    password: str | None = None,
+    token: str | None = None,
+) -> tuple[str, str]:
+    base_url = str(gateway_url or DEFAULT_OPENCLAW_GATEWAY_URL).strip().rstrip("/")
+    if not base_url:
+        raise RuntimeError("OPENCLAW_GATEWAY_URL is empty")
+
+    url = f"{base_url}/v1/chat/completions"
+    req_body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    auth_errors: list[str] = []
+
+    for auth_mode, secret in _gateway_auth_candidates(password=password, token=token):
+        headers = {"Content-Type": "application/json", "Accept": "application/json"}
+        if secret:
+            headers["Authorization"] = f"Bearer {secret}"
+
+        req = urllib.request.Request(url, data=req_body, headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=max(5, int(timeout_sec))) as resp:
+                raw = resp.read().decode("utf-8", errors="replace")
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8", errors="replace") if hasattr(e, "read") else ""
+            if e.code == 401:
+                auth_errors.append(f"{auth_mode}: unauthorized")
+                continue
+            raise RuntimeError(f"OpenClaw HTTP {e.code}: {body[:400]}")
+        except Exception as e:
+            raise RuntimeError(f"OpenClaw request failed: {e}")
+
+        parsed = _safe_json_loads(raw)
+        if not parsed:
+            raise RuntimeError(f"OpenClaw returned non-JSON response: {raw[:400]}")
+
+        choices = parsed.get("choices") if isinstance(parsed, dict) else None
+        if not isinstance(choices, list) or not choices:
+            raise RuntimeError("OpenClaw returned empty choices")
+
+        msg = choices[0].get("message") if isinstance(choices[0], dict) else None
+        txt = str(msg.get("content") if isinstance(msg, dict) else "").strip()
+        if not txt:
+            raise RuntimeError("OpenClaw returned empty text")
+
+        return txt, auth_mode
+
+    if auth_errors:
+        raise RuntimeError("; ".join(auth_errors))
+    raise RuntimeError("OpenClaw request failed: no auth method succeeded")
+
+
+def describe_image_via_openclaw(
+    path: Path,
+    mime_type: str = "",
+    gateway_url: str = DEFAULT_OPENCLAW_GATEWAY_URL,
+    timeout_sec: int = DEFAULT_OPENCLAW_DESCRIBE_TIMEOUT,
+) -> tuple[str, str]:
+    img_bytes = path.read_bytes()
+    if not img_bytes:
+        raise RuntimeError("image file is empty")
+
+    img_mime = str(mime_type or "").strip().lower()
+    if not img_mime:
+        guessed, _ = mimetypes.guess_type(str(path))
+        img_mime = str(guessed or "image/jpeg")
+
+    b64 = base64.b64encode(img_bytes).decode("ascii")
+    data_uri = f"data:{img_mime};base64,{b64}"
+
+    prompt_common = (
+        "Опиши изображение кратко и по фактам для полнотекстового поиска в архиве сообщений. "
+        "1-2 предложения, без домыслов."
+    )
+
+    attempts: list[str] = []
+
+    # Attempt 1: OpenAI-compatible image_url content (если endpoint поддерживает multimodal блоки).
+    payload_image_url = {
+        "model": "openclaw",
+        "temperature": 0,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt_common},
+                    {"type": "image_url", "image_url": {"url": data_uri}},
+                ],
+            }
+        ],
+    }
+    try:
+        txt, auth_mode = _openclaw_chat_completions_text(
+            payload_image_url,
+            gateway_url=gateway_url,
+            timeout_sec=timeout_sec,
+        )
+        if not _looks_like_image_not_seen_response(txt):
+            return txt, f"openclaw-gateway:chat-completions:image_url:{auth_mode}"
+        attempts.append("image_url content was accepted but image seems ignored")
+    except Exception as e:
+        attempts.append(f"image_url attempt failed: {e}")
+
+    # Attempt 2: path adapter (работает с текущим OpenClaw endpoint, где chat payload сводится к text).
+    local_path = str(path.resolve())
+    payload_path_prompt = {
+        "model": "openclaw",
+        "temperature": 0,
+        "messages": [
+            {
+                "role": "user",
+                "content": (
+                    f"{prompt_common}\n"
+                    f"Локальный путь к изображению: {local_path}\n"
+                    "Используй доступные инструменты анализа изображения, если нужно."
+                ),
+            }
+        ],
+    }
+
+    try:
+        txt, auth_mode = _openclaw_chat_completions_text(
+            payload_path_prompt,
+            gateway_url=gateway_url,
+            timeout_sec=timeout_sec,
+        )
+        return txt, f"openclaw-gateway:chat-completions:path:{auth_mode}"
+    except Exception as e:
+        attempts.append(f"path adapter failed: {e}")
+        raise RuntimeError(" | ".join(attempts))
 
 
 def describe_image_openai(path: Path, mime_type: str = "", model: str = DEFAULT_DESCRIBE_MODEL, timeout_sec: int = 240) -> tuple[str, str]:
@@ -1077,25 +1272,32 @@ def describe_image_openai(path: Path, mime_type: str = "", model: str = DEFAULT_
     return txt, f"openai-vision:{model}"
 
 
-def describe_image_with_fallback(path: Path, mime_type: str, model: str = DEFAULT_DESCRIBE_MODEL) -> tuple[str, str, list[str]]:
+def describe_image_with_fallback(
+    path: Path,
+    mime_type: str,
+    model: str = DEFAULT_DESCRIBE_MODEL,
+    backend: str = DEFAULT_IMAGE_DESCRIBE_BACKEND,
+) -> tuple[str, str, list[str]]:
     errs: list[str] = []
+    backend_mode = _normalize_image_describe_backend(backend)
 
-    try:
-        txt, engine = describe_image_openai(path, mime_type=mime_type, model=model)
-        return txt, engine, errs
-    except Exception as e:
-        errs.append(str(e))
+    if backend_mode in {"auto", "openclaw"}:
+        try:
+            txt, engine = describe_image_via_openclaw(path, mime_type=mime_type)
+            return txt, engine, errs
+        except Exception as e:
+            errs.append(f"openclaw: {e}")
 
-    guessed, _ = mimetypes.guess_type(str(path))
-    img_mime = str(mime_type or guessed or "").strip() or "unknown"
-    size = 0
-    try:
-        size = int(path.stat().st_size)
-    except Exception:
-        size = 0
+    if backend_mode in {"auto", "openai"}:
+        try:
+            txt, engine = describe_image_openai(path, mime_type=mime_type, model=model)
+            return txt, engine, errs
+        except Exception as e:
+            errs.append(f"openai: {e}")
 
-    fallback = f"[image] Описание недоступно (vision недоступен). mime={img_mime} size={size}"
-    return fallback, "fallback:meta", errs
+    if errs:
+        raise RuntimeError(" | ".join(errs))
+    raise RuntimeError(f"No image describe backend available for mode={backend_mode}")
 
 
 def normalize_notification(notification: dict[str, Any], media_url: str) -> dict[str, Any] | None:
@@ -1548,6 +1750,8 @@ def _enrich_media_and_transcript(
         "keepMediaFiles": bool(keep_media_files),
         "describeImages": bool(describe_images),
         "transcribeAudio": bool(transcribe_audio),
+        "imageDescribeBackend": _normalize_image_describe_backend(DEFAULT_IMAGE_DESCRIBE_BACKEND),
+        "openclawGatewayUrl": DEFAULT_OPENCLAW_GATEWAY_URL,
     }
 
     media_info: dict[str, Any] | None = None
@@ -1627,47 +1831,52 @@ def _enrich_media_and_transcript(
                     media_path,
                     mime_type=image_mime,
                     model=describe_model,
+                    backend=DEFAULT_IMAGE_DESCRIBE_BACKEND,
                 )
                 desc = str(desc or "").strip()
                 if desc:
                     prev = str(row.get("text") or "").strip()
-                    if prev and not (prev.startswith("<media:") and prev.endswith(">")):
-                        row["text"] = f"{prev}\n[image description] {desc}"
+                    if prev and not _is_media_placeholder_text(prev):
+                        row["text"] = f"{prev}\n{desc}"
                     else:
-                        row["text"] = f"[image description] {desc}"
+                        row["text"] = desc
                     diag["imageDescription"] = {
                         "ok": True,
                         "engine": engine,
                         "chars": len(desc),
                         "fallbackErrors": fallback_errors,
+                        "pending_reprocess": False,
                     }
                     result["images_described"] = 1
                 else:
                     diag["imageDescription"] = {
                         "ok": False,
                         "error": "empty image description",
+                        "pending_reprocess": True,
                     }
+                    _set_image_description_failed_text(row)
             except Exception as e:
                 diag["imageDescription"] = {
                     "ok": False,
                     "error": str(e),
+                    "pending_reprocess": True,
                 }
+                _set_image_description_failed_text(row)
                 logging.warning("Image description failed for %s: %s", row.get("source_message_id"), e)
         elif describe_images:
             diag["imageDescription"] = {
                 "ok": False,
                 "error": "image media not downloaded",
+                "pending_reprocess": True,
             }
+            _set_image_description_failed_text(row)
         else:
             diag["imageDescription"] = {
                 "ok": False,
                 "skipped": True,
                 "reason": "disabled by flag",
+                "pending_reprocess": False,
             }
-
-        current = str(row.get("text") or "").strip()
-        if not current or (current.startswith("<media:") and current.endswith(">")):
-            row["text"] = _build_media_meta_text(meta, suffix="description_unavailable")
 
     if not needs_download:
         current = str(row.get("text") or "").strip()
