@@ -171,6 +171,20 @@ python3 scripts/greenapi_ingest.py run --source auto --poll-sleep 0.5 --max-even
 ./scripts/verify_media_transcript.sh ./wa_archive.db 300 ./data/media
 ```
 
+## Embeddings backfill (новое)
+
+`greenapi_ingest.py` пишет в `messages`, а embeddings считаются отдельным шагом.
+
+```bash
+# dry-run: сколько кандидатов без векторов
+python3 scripts/embed_missing.py --db ./wa_archive.db --batch 50 --dry-run
+
+# реальный прогон (нужен OPENAI_API_KEY)
+python3 scripts/embed_missing.py --db ./wa_archive.db --batch 50
+```
+
+Рекомендуется запускать периодически (cron/systemd timer), например раз в 2-5 минут.
+
 ## Быстрый ручной прогон (1 image + 1 voice)
 
 ```bash

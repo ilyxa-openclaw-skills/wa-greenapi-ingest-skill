@@ -26,7 +26,7 @@ if [[ ${#missing[@]} -gt 0 ]]; then
 fi
 
 echo "[smoke] Python синтаксис"
-python3 -m py_compile "$INGEST_SCRIPT"
+python3 -m py_compile "$INGEST_SCRIPT" "$ROOT_DIR/scripts/embed_missing.py"
 
 echo "[smoke] history direction self-check"
 python3 "$ROOT_DIR/scripts/history_direction_selfcheck.py"
