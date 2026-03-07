@@ -86,9 +86,11 @@ DEFAULT_HTTP_TIMEOUT = int(os.getenv("GREENAPI_HTTP_TIMEOUT_SEC", "45"))
 SOURCE_QUEUE = "queue"
 SOURCE_HISTORY = "history"
 SOURCE_AUTO = "auto"
+SOURCE_CHAT_HISTORY = "chat-history"
 
 SOURCE_TYPE_QUEUE = "greenapi"
 SOURCE_TYPE_HISTORY = "greenapi-history"
+SOURCE_TYPE_CHAT_HISTORY = "greenapi-chat-history"
 
 URL_KEY_CANDIDATES = {
     "downloadurl",
@@ -436,6 +438,37 @@ class GreenApiClient:
         for item in self.last_incoming_messages():
             merged.append({"direction_hint": "in", "event": item})
         return merged
+
+    def list_chats(self) -> list[dict[str, Any]]:
+        """Best-effort список чатов. Endpoint может отличаться между версиями GREEN-API."""
+        candidates = [
+            f"{self.api_url}/waInstance{self.id_instance}/getChats/{self.api_token}",
+            f"{self.api_url}/waInstance{self.id_instance}/getChatsSettings/{self.api_token}",
+        ]
+        for url in candidates:
+            data = self._request_json("GET", url, quiet_errors=True)
+            items = self._extract_history_items(data)
+            if items:
+                return items
+            if isinstance(data, dict):
+                result = data.get("result")
+                if isinstance(result, list):
+                    return [x for x in result if isinstance(x, dict)]
+        return []
+
+    def get_chat_history(self, chat_id: str, count: int = 100, id_message: str = "") -> list[dict[str, Any]]:
+        if not chat_id:
+            return []
+        payload: dict[str, Any] = {
+            "chatId": str(chat_id).strip(),
+            "count": max(1, min(1000, int(count))),
+        }
+        if str(id_message or "").strip():
+            payload["idMessage"] = str(id_message).strip()
+
+        url = f"{self.api_url}/waInstance{self.id_instance}/getChatHistory/{self.api_token}"
+        data = self._request_json("POST", url, payload=payload, quiet_errors=True)
+        return self._extract_history_items(data)
 
 
 class SinceFilter:
@@ -1864,6 +1897,7 @@ def normalize_history_event(
     history_event: dict[str, Any],
     media_url: str,
     direction_hint: str | None = None,
+    source_type: str = SOURCE_TYPE_HISTORY,
 ) -> dict[str, Any] | None:
     if not isinstance(history_event, dict):
         return None
@@ -1905,11 +1939,99 @@ def normalize_history_event(
         "raw_obj": raw_obj,
         "raw_json": json.dumps(raw_obj, ensure_ascii=False),
         "source_line": source_line[:2000],
-        "source_type": SOURCE_TYPE_HISTORY,
+        "source_type": source_type,
         "source_message_id": source_message_id,
         "_payload": payload,
         "_media_meta": media_meta,
     }
+
+
+def _normalize_chat_id(raw: Any) -> str:
+    v = str(raw or "").strip()
+    if not v:
+        return ""
+    if "@" in v:
+        return v
+    digits = re.sub(r"\D+", "", v)
+    if digits:
+        return f"{digits}@c.us"
+    return ""
+
+
+def _collect_chat_ids_from_items(items: list[dict[str, Any]]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+
+    for item in items:
+        candidates = (
+            item.get("chatId"),
+            item.get("id"),
+            item.get("jid"),
+            item.get("peer"),
+            item.get("name"),
+        )
+        chat_id = ""
+        for c in candidates:
+            normalized = _normalize_chat_id(c)
+            if normalized:
+                chat_id = normalized
+                break
+        if chat_id and chat_id not in seen:
+            seen.add(chat_id)
+            out.append(chat_id)
+
+    return out
+
+
+def _db_known_chat_ids(conn: sqlite3.Connection) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    rows = conn.execute("SELECT DISTINCT peer FROM messages WHERE peer IS NOT NULL AND peer <> ''").fetchall()
+    for (peer_raw,) in rows:
+        chat_id = _normalize_chat_id(peer_raw)
+        if chat_id and chat_id not in seen:
+            seen.add(chat_id)
+            out.append(chat_id)
+    return out
+
+
+def _discover_full_history_chat_ids(
+    client: GreenApiClient,
+    conn: sqlite3.Connection,
+    max_chats: int,
+) -> list[str]:
+    merged: list[str] = []
+    seen: set[str] = set()
+
+    def add_many(ids: list[str]) -> None:
+        for chat_id in ids:
+            if not chat_id or chat_id in seen:
+                continue
+            seen.add(chat_id)
+            merged.append(chat_id)
+            if max_chats > 0 and len(merged) >= max_chats:
+                return
+
+    # 1) API chat list (если доступно)
+    add_many(_collect_chat_ids_from_items(client.list_chats()))
+
+    # 2) Уже известные peers из локальной БД
+    if max_chats <= 0 or len(merged) < max_chats:
+        add_many(_db_known_chat_ids(conn))
+
+    # 3) Journals (lastIncoming/lastOutgoing) как стартовые чаты
+    if max_chats <= 0 or len(merged) < max_chats:
+        journal_ids: list[str] = []
+        for wrapped in client.fetch_history_messages():
+            event = wrapped.get("event") if isinstance(wrapped.get("event"), dict) else {}
+            journal_ids.append(_normalize_chat_id(event.get("chatId")))
+            journal_ids.append(_normalize_chat_id(event.get("senderId")))
+            journal_ids.append(_normalize_chat_id(event.get("recipientId")))
+        add_many([x for x in journal_ids if x])
+
+    if max_chats > 0:
+        return merged[:max_chats]
+    return merged
 
 
 def _should_replace_text(existing_text: str, incoming_text: str) -> bool:
@@ -3269,6 +3391,178 @@ def ingest_history_once(
             conn.close()
 
 
+def ingest_full_history_once(
+    client: GreenApiClient,
+    db_path: Path,
+    state_path: Path,
+    media_dir: Path,
+    dry_run: bool = False,
+    transcribe_audio: bool = True,
+    transcribe_model: str = DEFAULT_TRANSCRIBE_MODEL,
+    transcribe_language: str | None = DEFAULT_TRANSCRIBE_LANGUAGE,
+    describe_images: bool = True,
+    describe_model: str = DEFAULT_DESCRIBE_MODEL,
+    keep_media_files: bool = DEFAULT_KEEP_MEDIA_FILES,
+    since_filter: SinceFilter | None = None,
+    history_batch_size: int = 100,
+    max_chats: int = 20,
+    max_messages: int = 2000,
+    max_batches_per_chat: int = 20,
+    refresh_chat_list: bool = False,
+) -> dict[str, Any]:
+    state = _load_json(state_path, default={})
+    result = _empty_stats(dry_run)
+
+    conn: sqlite3.Connection | None = None
+    try:
+        if not dry_run:
+            conn = ensure_db(db_path)
+        else:
+            conn = ensure_db(db_path)
+
+        full_state = state.get("full_history") if isinstance(state.get("full_history"), dict) else {}
+        if not isinstance(full_state, dict):
+            full_state = {}
+
+        chat_order = full_state.get("chat_order") if isinstance(full_state.get("chat_order"), list) else []
+        chat_order = [str(x).strip() for x in chat_order if str(x).strip()]
+
+        if refresh_chat_list or not chat_order:
+            discovered = _discover_full_history_chat_ids(client, conn=conn, max_chats=max(0, int(max_chats)))
+            if discovered:
+                chat_order = discovered
+                full_state["chat_order"] = chat_order
+                full_state["current_chat_index"] = 0
+
+        if max_chats > 0:
+            chat_order = chat_order[:max_chats]
+
+        if not chat_order:
+            state["last_source_mode"] = SOURCE_CHAT_HISTORY
+            state["last_run_utc"] = dt.datetime.now(tz=dt.timezone.utc).isoformat()
+            state["full_history"] = full_state
+            _save_json(state_path, state)
+            return result
+
+        cursors = full_state.get("chat_cursors") if isinstance(full_state.get("chat_cursors"), dict) else {}
+        completed = set(str(x).strip() for x in (full_state.get("completed_chats") or []) if str(x).strip())
+        current_idx = int(full_state.get("current_chat_index") or 0)
+
+        batch_size = max(1, min(1000, int(history_batch_size)))
+        limit_messages = max(1, int(max_messages))
+        limit_batches = max(1, int(max_batches_per_chat))
+
+        processed_total = 0
+        processed_chat_ids: list[str] = []
+
+        for idx in range(current_idx, len(chat_order)):
+            if processed_total >= limit_messages:
+                break
+
+            chat_id = chat_order[idx]
+            if not chat_id:
+                continue
+            if chat_id in completed:
+                continue
+
+            processed_chat_ids.append(chat_id)
+            cursor = str(cursors.get(chat_id) or "").strip()
+            batches = 0
+            chat_inserted = 0
+
+            while batches < limit_batches and processed_total < limit_messages:
+                rows = client.get_chat_history(chat_id=chat_id, count=batch_size, id_message=cursor)
+                if not rows:
+                    completed.add(chat_id)
+                    break
+
+                rows_sorted = sorted(rows, key=lambda ev: (_iso_to_epoch(_history_timestamp_raw(ev)) or 0.0, _first_non_empty(ev.get("idMessage"), ev.get("id"))))
+                newest_id = ""
+
+                for event in rows_sorted:
+                    if processed_total >= limit_messages:
+                        break
+                    try:
+                        normalized = normalize_history_event(
+                            event,
+                            media_url=client.media_url,
+                            direction_hint=None,
+                            source_type=SOURCE_TYPE_CHAT_HISTORY,
+                        )
+                        _process_normalized_row(
+                            client=client,
+                            conn=conn,
+                            result=result,
+                            normalized=normalized,
+                            dry_run=dry_run,
+                            media_dir=media_dir,
+                            transcribe_audio=transcribe_audio,
+                            transcribe_model=transcribe_model,
+                            transcribe_language=transcribe_language,
+                            describe_images=describe_images,
+                            describe_model=describe_model,
+                            keep_media_files=keep_media_files,
+                            since_filter=since_filter,
+                        )
+                        processed_total += 1
+                        msg_id = _first_non_empty(event.get("idMessage"), event.get("id"), event.get("stanzaId"))
+                        if msg_id:
+                            newest_id = msg_id
+                    except Exception:
+                        result["errors"] += 1
+                        logging.exception("Ошибка обработки full-history сообщения chatId=%s", chat_id)
+
+                batches += 1
+                result["received"] += len(rows_sorted)
+
+                if newest_id:
+                    cursor = newest_id
+                    cursors[chat_id] = cursor
+
+                # checkpoint после каждого батча
+                full_state["chat_cursors"] = cursors
+                full_state["current_chat_index"] = idx
+                full_state["current_chat_id"] = chat_id
+                full_state["last_batch_cursor"] = cursor
+                full_state["completed_chats"] = sorted(completed)
+                full_state["updated_at"] = dt.datetime.now(tz=dt.timezone.utc).isoformat()
+                state["full_history"] = full_state
+                state["last_source_mode"] = SOURCE_CHAT_HISTORY
+                state["last_run_utc"] = full_state["updated_at"]
+                _save_json(state_path, state)
+
+                if not newest_id:
+                    completed.add(chat_id)
+                    break
+
+                if len(rows_sorted) < batch_size:
+                    completed.add(chat_id)
+                    break
+
+                chat_inserted += len(rows_sorted)
+
+            if chat_id in completed:
+                full_state["current_chat_index"] = min(idx + 1, len(chat_order) - 1)
+
+        full_state["chat_order"] = chat_order
+        full_state["chat_cursors"] = cursors
+        full_state["completed_chats"] = sorted(completed)
+        full_state["last_chat_ids_touched"] = processed_chat_ids
+        full_state["updated_at"] = dt.datetime.now(tz=dt.timezone.utc).isoformat()
+        state["full_history"] = full_state
+        state["last_source_mode"] = SOURCE_CHAT_HISTORY
+        state["last_run_utc"] = full_state["updated_at"]
+        _save_json(state_path, state)
+
+        if conn is not None:
+            conn.commit()
+
+        return result
+    finally:
+        if conn is not None:
+            conn.close()
+
+
 def ingest_once_by_source(
     client: GreenApiClient,
     db_path: Path,
@@ -3285,6 +3579,11 @@ def ingest_once_by_source(
     since_filter: SinceFilter | None,
     source: str,
     max_history_events: int,
+    full_history_batch_size: int = 100,
+    full_history_max_chats: int = 20,
+    full_history_max_messages: int = 2000,
+    full_history_max_batches_per_chat: int = 20,
+    full_history_refresh_chat_list: bool = False,
 ) -> dict[str, Any]:
     source_mode = str(source or SOURCE_AUTO).strip().lower()
 
@@ -3320,6 +3619,27 @@ def ingest_once_by_source(
             keep_media_files=keep_media_files,
             since_filter=since_filter,
             max_events=max_history_events,
+        )
+
+    if source_mode == SOURCE_CHAT_HISTORY:
+        return ingest_full_history_once(
+            client=client,
+            db_path=db_path,
+            state_path=state_path,
+            media_dir=media_dir,
+            dry_run=dry_run,
+            transcribe_audio=transcribe_audio,
+            transcribe_model=transcribe_model,
+            transcribe_language=transcribe_language,
+            describe_images=describe_images,
+            describe_model=describe_model,
+            keep_media_files=keep_media_files,
+            since_filter=since_filter,
+            history_batch_size=full_history_batch_size,
+            max_chats=full_history_max_chats,
+            max_messages=full_history_max_messages,
+            max_batches_per_chat=full_history_max_batches_per_chat,
+            refresh_chat_list=full_history_refresh_chat_list,
         )
 
     queue_stats = ingest_queue_once(
@@ -3383,6 +3703,11 @@ def ingest_batch(
     since_filter: SinceFilter | None,
     max_events: int,
     source: str = SOURCE_AUTO,
+    full_history_batch_size: int = 100,
+    full_history_max_chats: int = 20,
+    full_history_max_messages: int = 2000,
+    full_history_max_batches_per_chat: int = 20,
+    full_history_refresh_chat_list: bool = False,
 ) -> dict[str, Any]:
     n = max(1, int(max_events))
     source_mode = str(source or SOURCE_AUTO).strip().lower()
@@ -3404,6 +3729,27 @@ def ingest_batch(
             keep_media_files=keep_media_files,
             since_filter=since_filter,
             max_events=n,
+        )
+
+    if source_mode == SOURCE_CHAT_HISTORY:
+        return ingest_full_history_once(
+            client=client,
+            db_path=db_path,
+            state_path=state_path,
+            media_dir=media_dir,
+            dry_run=dry_run,
+            transcribe_audio=transcribe_audio,
+            transcribe_model=transcribe_model,
+            transcribe_language=transcribe_language,
+            describe_images=describe_images,
+            describe_model=describe_model,
+            keep_media_files=keep_media_files,
+            since_filter=since_filter,
+            history_batch_size=full_history_batch_size,
+            max_chats=full_history_max_chats,
+            max_messages=full_history_max_messages,
+            max_batches_per_chat=full_history_max_batches_per_chat,
+            refresh_chat_list=full_history_refresh_chat_list,
         )
 
     for _ in range(n):
@@ -3516,6 +3862,26 @@ def run_loop(
                     since_filter=since_filter,
                     max_events=history_limit,
                 )
+            elif source_mode == SOURCE_CHAT_HISTORY:
+                stats = ingest_full_history_once(
+                    client=client,
+                    db_path=db_path,
+                    state_path=state_path,
+                    media_dir=media_dir,
+                    dry_run=dry_run,
+                    transcribe_audio=transcribe_audio,
+                    transcribe_model=transcribe_model,
+                    transcribe_language=transcribe_language,
+                    describe_images=describe_images,
+                    describe_model=describe_model,
+                    keep_media_files=keep_media_files,
+                    since_filter=since_filter,
+                    history_batch_size=max(1, min(200, history_limit)),
+                    max_chats=20,
+                    max_messages=history_limit,
+                    max_batches_per_chat=20,
+                    refresh_chat_list=False,
+                )
             else:
                 queue_stats = ingest_queue_once(
                     client=client,
@@ -3620,9 +3986,9 @@ def main() -> None:
     )
     common.add_argument(
         "--source",
-        choices=[SOURCE_QUEUE, SOURCE_HISTORY, SOURCE_AUTO],
+        choices=[SOURCE_QUEUE, SOURCE_HISTORY, SOURCE_CHAT_HISTORY, SOURCE_AUTO],
         default=SOURCE_AUTO,
-        help="Источник событий: queue | history | auto (auto: сначала queue, если 0 — history)",
+        help="Источник событий: queue | history | chat-history | auto",
     )
     common.add_argument(
         "--since",
@@ -3646,6 +4012,13 @@ def main() -> None:
     common.add_argument("--verbose", action="store_true", help="Подробные логи")
 
     sub.add_parser("ingest-once", parents=[common], help="Принять до --max-events уведомлений и выйти")
+
+    p_full = sub.add_parser("ingest-full-history", parents=[common], help="One-shot глубокий импорт истории по чатам")
+    p_full.add_argument("--history-batch-size", type=int, default=100, help="Размер батча GetChatHistory (реком. 50-200)")
+    p_full.add_argument("--max-chats", type=int, default=20, help="Сколько чатов обрабатывать за запуск (0=без лимита)")
+    p_full.add_argument("--max-messages", type=int, default=2000, help="Лимит сообщений за запуск")
+    p_full.add_argument("--max-batches-per-chat", type=int, default=20, help="Лимит батчей на чат за запуск")
+    p_full.add_argument("--refresh-chat-list", action="store_true", help="Пересобрать список чатов (API + DB + journals)")
 
     p_run = sub.add_parser("run", parents=[common], help="Запустить polling")
     p_run.add_argument("--poll-sleep", type=float, default=DEFAULT_POLL_SLEEP, help="Пауза между циклами")
@@ -3685,6 +4058,34 @@ def main() -> None:
             since_filter=since_filter,
             max_events=max(1, int(args.max_events if args.max_events is not None else 1)),
             source=str(args.source or SOURCE_AUTO).strip().lower(),
+            full_history_batch_size=100,
+            full_history_max_chats=20,
+            full_history_max_messages=max(1, int(args.max_events if args.max_events is not None else 2000)),
+            full_history_max_batches_per_chat=20,
+            full_history_refresh_chat_list=False,
+        )
+        print(json.dumps(stats, ensure_ascii=False))
+        return
+
+    if args.cmd == "ingest-full-history":
+        stats = ingest_full_history_once(
+            client=client,
+            db_path=args.db,
+            state_path=args.state,
+            media_dir=args.media_dir,
+            dry_run=bool(args.dry_run),
+            transcribe_audio=transcribe_audio,
+            transcribe_model=str(args.transcribe_model or DEFAULT_TRANSCRIBE_MODEL),
+            transcribe_language=str(args.transcribe_language or "").strip() or None,
+            describe_images=describe_images,
+            describe_model=str(args.describe_model or DEFAULT_DESCRIBE_MODEL),
+            keep_media_files=keep_media_files,
+            since_filter=since_filter,
+            history_batch_size=max(1, int(args.history_batch_size)),
+            max_chats=max(0, int(args.max_chats)),
+            max_messages=max(1, int(args.max_messages)),
+            max_batches_per_chat=max(1, int(args.max_batches_per_chat)),
+            refresh_chat_list=bool(args.refresh_chat_list),
         )
         print(json.dumps(stats, ensure_ascii=False))
         return

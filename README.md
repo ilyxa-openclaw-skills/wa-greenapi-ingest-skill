@@ -165,6 +165,57 @@ set -a && source .env && set +a
 python3 scripts/greenapi_ingest.py run --source auto --poll-sleep 0.5 --max-events 20 --verbose
 ```
 
+## One-shot full history import (GetChatHistory)
+
+Новый режим глубокого импорта: `ingest-full-history` (или `ingest-once --source chat-history`).
+
+Что делает:
+
+- пытается взять список чатов из API (`getChats`),
+- если API списка недоступно — использует known peers из БД,
+- дополнительно добирает кандидатов из journals (`lastIncoming/lastOutgoing`),
+- для каждого chatId запрашивает `getChatHistory` батчами,
+- сохраняет checkpoint в state (`full_history.chat_cursors/current_chat_index/current_chat_id`).
+
+### Базовый безопасный прод-батч
+
+```bash
+set -a && source .env && set +a
+python3 scripts/greenapi_ingest.py ingest-full-history \
+  --history-batch-size 100 \
+  --max-chats 10 \
+  --max-messages 1000 \
+  --max-batches-per-chat 10 \
+  --refresh-chat-list \
+  --verbose
+```
+
+### Догонять порциями (resume с checkpoint)
+
+Повторный запуск продолжает с сохранённого курсора:
+
+```bash
+set -a && source .env && set +a
+python3 scripts/greenapi_ingest.py ingest-full-history \
+  --history-batch-size 100 \
+  --max-chats 10 \
+  --max-messages 1000 \
+  --max-batches-per-chat 10 \
+  --verbose
+```
+
+### Очень осторожный режим (если есть риски timeout)
+
+```bash
+set -a && source .env && set +a
+python3 scripts/greenapi_ingest.py ingest-full-history \
+  --history-batch-size 50 \
+  --max-chats 5 \
+  --max-messages 300 \
+  --max-batches-per-chat 4 \
+  --verbose
+```
+
 ## Verify text-first
 
 ```bash
