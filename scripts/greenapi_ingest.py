@@ -21,6 +21,7 @@ import json
 import logging
 import mimetypes
 import os
+import random
 import re
 import shutil
 import sqlite3
@@ -32,6 +33,7 @@ import urllib.parse
 import urllib.request
 import zipfile
 import xml.etree.ElementTree as ET
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any
 
@@ -82,11 +84,32 @@ DEFAULT_TEXT_ANALYZE_MAX_CHARS = int(os.getenv("GREENAPI_TEXT_ANALYZE_MAX_CHARS"
 DEFAULT_OFFICE_MIN_CHARS = int(os.getenv("GREENAPI_OFFICE_MIN_CHARS", "24"))
 DEFAULT_PDF_MAX_PAGES = int(os.getenv("GREENAPI_PDF_MAX_PAGES", "20"))
 DEFAULT_HTTP_TIMEOUT = int(os.getenv("GREENAPI_HTTP_TIMEOUT_SEC", "45"))
+DEFAULT_HTTP_MAX_RETRIES = max(0, int(os.getenv("GREENAPI_HTTP_MAX_RETRIES", "5")))
+DEFAULT_HTTP_BACKOFF_BASE_SEC = max(0.05, float(os.getenv("GREENAPI_HTTP_BACKOFF_BASE_SEC", "0.8")))
+DEFAULT_HTTP_BACKOFF_MAX_SEC = max(
+    DEFAULT_HTTP_BACKOFF_BASE_SEC,
+    float(os.getenv("GREENAPI_HTTP_BACKOFF_MAX_SEC", "20")),
+)
+DEFAULT_HTTP_BACKOFF_JITTER_SEC = max(0.0, float(os.getenv("GREENAPI_HTTP_BACKOFF_JITTER_SEC", "0.4")))
 
 SOURCE_QUEUE = "queue"
 SOURCE_HISTORY = "history"
 SOURCE_AUTO = "auto"
 SOURCE_CHAT_HISTORY = "chat-history"
+
+CHAT_HISTORY_PAGINATION_OFF = "off"
+CHAT_HISTORY_PAGINATION_AUTO = "auto"
+CHAT_HISTORY_PAGINATION_FORCE = "force"
+DEFAULT_CHAT_HISTORY_PAGINATION = (
+    str(os.getenv("GREENAPI_CHAT_HISTORY_PAGINATION", CHAT_HISTORY_PAGINATION_OFF)).strip().lower()
+    or CHAT_HISTORY_PAGINATION_OFF
+)
+if DEFAULT_CHAT_HISTORY_PAGINATION not in {
+    CHAT_HISTORY_PAGINATION_OFF,
+    CHAT_HISTORY_PAGINATION_AUTO,
+    CHAT_HISTORY_PAGINATION_FORCE,
+}:
+    DEFAULT_CHAT_HISTORY_PAGINATION = CHAT_HISTORY_PAGINATION_OFF
 
 SOURCE_TYPE_QUEUE = "greenapi"
 SOURCE_TYPE_HISTORY = "greenapi-history"
@@ -318,12 +341,137 @@ class GreenApiClient:
         id_instance: str,
         api_token: str,
         http_timeout_sec: int = DEFAULT_HTTP_TIMEOUT,
+        http_max_retries: int = DEFAULT_HTTP_MAX_RETRIES,
+        http_backoff_base_sec: float = DEFAULT_HTTP_BACKOFF_BASE_SEC,
+        http_backoff_max_sec: float = DEFAULT_HTTP_BACKOFF_MAX_SEC,
+        http_backoff_jitter_sec: float = DEFAULT_HTTP_BACKOFF_JITTER_SEC,
     ) -> None:
         self.api_url = api_url.rstrip("/")
         self.media_url = media_url.rstrip("/")
         self.id_instance = id_instance
         self.api_token = api_token
         self.http_timeout_sec = int(http_timeout_sec)
+        self.http_max_retries = max(0, int(http_max_retries))
+        self.http_backoff_base_sec = max(0.05, float(http_backoff_base_sec))
+        self.http_backoff_max_sec = max(self.http_backoff_base_sec, float(http_backoff_max_sec))
+        self.http_backoff_jitter_sec = max(0.0, float(http_backoff_jitter_sec))
+        self._retry_stats: dict[str, int] = {
+            "retries_total": 0,
+            "retries_429": 0,
+            "retries_5xx": 0,
+            "retries_network": 0,
+        }
+
+    def get_retry_stats(self) -> dict[str, int]:
+        return {k: int(v) for k, v in self._retry_stats.items()}
+
+    @staticmethod
+    def _parse_retry_after_seconds(raw: Any) -> float | None:
+        value = str(raw or "").strip()
+        if not value:
+            return None
+        if re.fullmatch(r"\d+(?:\.\d+)?", value):
+            try:
+                return max(0.0, float(value))
+            except Exception:
+                return None
+        try:
+            dt_value = parsedate_to_datetime(value)
+        except Exception:
+            return None
+        if dt_value is None:
+            return None
+        if dt_value.tzinfo is None:
+            dt_value = dt_value.replace(tzinfo=dt.timezone.utc)
+        delay = (dt_value - dt.datetime.now(tz=dt.timezone.utc)).total_seconds()
+        return max(0.0, delay)
+
+    @staticmethod
+    def _is_retryable_http_status(status_code: int) -> bool:
+        return status_code == 429 or 500 <= status_code <= 599
+
+    def _retry_delay_sec(self, attempt_no: int, retry_after_sec: float | None) -> float:
+        if retry_after_sec is not None:
+            return max(0.0, float(retry_after_sec))
+        backoff = min(self.http_backoff_max_sec, self.http_backoff_base_sec * (2 ** max(0, int(attempt_no))))
+        jitter = random.uniform(0.0, self.http_backoff_jitter_sec) if self.http_backoff_jitter_sec > 0 else 0.0
+        return max(0.0, backoff + jitter)
+
+    def _request_raw(
+        self,
+        method: str,
+        url: str,
+        *,
+        data: bytes | None = None,
+        headers: dict[str, str] | None = None,
+        quiet_errors: bool = False,
+    ) -> tuple[bytes, str] | None:
+        req_headers = dict(headers or {})
+
+        for attempt in range(self.http_max_retries + 1):
+            req = urllib.request.Request(url, headers=req_headers, data=data, method=method)
+            try:
+                with urllib.request.urlopen(req, timeout=self.http_timeout_sec) as resp:
+                    ctype = str(resp.headers.get("Content-Type") or "").strip()
+                    return resp.read(), ctype
+
+            except urllib.error.HTTPError as e:
+                status_code = int(getattr(e, "code", 0) or 0)
+                body = e.read().decode("utf-8", errors="replace") if hasattr(e, "read") else ""
+                retryable = self._is_retryable_http_status(status_code)
+                can_retry = retryable and attempt < self.http_max_retries
+
+                if can_retry:
+                    headers_obj = getattr(e, "headers", None)
+                    retry_after_raw = headers_obj.get("Retry-After") if hasattr(headers_obj, "get") else None
+                    retry_after = self._parse_retry_after_seconds(retry_after_raw)
+                    delay_sec = self._retry_delay_sec(attempt, retry_after)
+                    self._retry_stats["retries_total"] += 1
+                    if status_code == 429:
+                        self._retry_stats["retries_429"] += 1
+                    elif 500 <= status_code <= 599:
+                        self._retry_stats["retries_5xx"] += 1
+                    if not quiet_errors:
+                        logging.warning(
+                            "HTTP %s %s -> %s, retry %s/%s in %.2fs",
+                            method,
+                            url,
+                            status_code,
+                            attempt + 1,
+                            self.http_max_retries,
+                            delay_sec,
+                        )
+                    time.sleep(delay_sec)
+                    continue
+
+                if not quiet_errors:
+                    logging.error("HTTP %s %s -> %s %s", method, url, status_code, body[:300])
+                return None
+
+            except Exception as e:
+                can_retry = attempt < self.http_max_retries
+                if can_retry:
+                    delay_sec = self._retry_delay_sec(attempt, None)
+                    self._retry_stats["retries_total"] += 1
+                    self._retry_stats["retries_network"] += 1
+                    if not quiet_errors:
+                        logging.warning(
+                            "HTTP %s %s failed (%s), retry %s/%s in %.2fs",
+                            method,
+                            url,
+                            e,
+                            attempt + 1,
+                            self.http_max_retries,
+                            delay_sec,
+                        )
+                    time.sleep(delay_sec)
+                    continue
+
+                if not quiet_errors:
+                    logging.error("Ошибка HTTP запроса: %s %s (%s)", method, url, e)
+                return None
+
+        return None
 
     def _request_json(
         self,
@@ -338,43 +486,22 @@ class GreenApiClient:
             data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
             headers["Content-Type"] = "application/json"
 
-        req = urllib.request.Request(url, headers=headers, data=data, method=method)
-        try:
-            with urllib.request.urlopen(req, timeout=self.http_timeout_sec) as resp:
-                raw = resp.read().decode("utf-8", errors="replace").strip()
-                if not raw:
-                    return None
-                try:
-                    return json.loads(raw)
-                except json.JSONDecodeError:
-                    if not quiet_errors:
-                        logging.error("Некорректный JSON от GREENAPI: %s", raw[:300])
-                    return None
-        except urllib.error.HTTPError as e:
-            body = e.read().decode("utf-8", errors="replace") if hasattr(e, "read") else ""
-            if not quiet_errors:
-                logging.error("HTTP %s %s -> %s %s", method, url, e.code, body[:300])
+        resp = self._request_raw(method, url, data=data, headers=headers, quiet_errors=quiet_errors)
+        if resp is None:
             return None
-        except Exception:
+        blob, _ = resp
+        raw = blob.decode("utf-8", errors="replace").strip()
+        if not raw:
+            return None
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
             if not quiet_errors:
-                logging.exception("Ошибка HTTP JSON запроса: %s %s", method, url)
+                logging.error("Некорректный JSON от GREENAPI: %s", raw[:300])
             return None
 
     def _request_bytes(self, method: str, url: str, quiet_errors: bool = False) -> tuple[bytes, str] | None:
-        req = urllib.request.Request(url, headers={"Accept": "*/*"}, method=method)
-        try:
-            with urllib.request.urlopen(req, timeout=self.http_timeout_sec) as resp:
-                ctype = str(resp.headers.get("Content-Type") or "").strip()
-                return resp.read(), ctype
-        except urllib.error.HTTPError as e:
-            if not quiet_errors:
-                body = e.read().decode("utf-8", errors="replace") if hasattr(e, "read") else ""
-                logging.error("HTTP %s %s -> %s %s", method, url, e.code, body[:300])
-            return None
-        except Exception:
-            if not quiet_errors:
-                logging.exception("Ошибка HTTP bytes запроса: %s %s", method, url)
-            return None
+        return self._request_raw(method, url, headers={"Accept": "*/*"}, quiet_errors=quiet_errors)
 
     def receive_notification(self, receive_timeout: int = 5) -> dict[str, Any] | None:
         timeout_val = max(5, min(60, int(receive_timeout)))
@@ -456,14 +583,20 @@ class GreenApiClient:
                     return [x for x in result if isinstance(x, dict)]
         return []
 
-    def get_chat_history(self, chat_id: str, count: int = 100, id_message: str = "") -> list[dict[str, Any]]:
+    def get_chat_history(
+        self,
+        chat_id: str,
+        count: int = 100,
+        id_message: str = "",
+        use_id_message: bool = False,
+    ) -> list[dict[str, Any]]:
         if not chat_id:
             return []
         payload: dict[str, Any] = {
             "chatId": str(chat_id).strip(),
             "count": max(1, min(1000, int(count))),
         }
-        if str(id_message or "").strip():
+        if use_id_message and str(id_message or "").strip():
             payload["idMessage"] = str(id_message).strip()
 
         url = f"{self.api_url}/waInstance{self.id_instance}/getChatHistory/{self.api_token}"
@@ -3170,8 +3303,34 @@ def _empty_stats(dry_run: bool) -> dict[str, Any]:
         "docs_analyzed": 0,
         "pdf_skipped": 0,
         "media_deleted": 0,
+        "chats_processed": 0,
+        "chats_empty": 0,
+        "chats_non_empty": 0,
+        "pagination_unavailable_chats": 0,
+        "http_retries_total": 0,
+        "http_retries_429": 0,
+        "http_retries_5xx": 0,
+        "http_retries_network": 0,
         "dry_run": bool(dry_run),
     }
+
+
+def _retry_stats_snapshot(client: GreenApiClient) -> dict[str, int]:
+    return client.get_retry_stats()
+
+
+def _apply_retry_stats_delta(result: dict[str, Any], before: dict[str, int], after: dict[str, int]) -> None:
+    keys = (
+        "retries_total",
+        "retries_429",
+        "retries_5xx",
+        "retries_network",
+    )
+    delta = {k: max(0, int(after.get(k, 0)) - int(before.get(k, 0))) for k in keys}
+    result["http_retries_total"] += delta["retries_total"]
+    result["http_retries_429"] += delta["retries_429"]
+    result["http_retries_5xx"] += delta["retries_5xx"]
+    result["http_retries_network"] += delta["retries_network"]
 
 
 def _process_normalized_row(
@@ -3254,6 +3413,7 @@ def ingest_queue_once(
 ) -> dict[str, Any]:
     state = _load_json(state_path, default={})
     result = _empty_stats(dry_run)
+    retry_before = _retry_stats_snapshot(client)
 
     conn: sqlite3.Connection | None = None
     try:
@@ -3262,6 +3422,7 @@ def ingest_queue_once(
 
         event = client.receive_notification(receive_timeout=receive_timeout)
         if not event:
+            _apply_retry_stats_delta(result, retry_before, _retry_stats_snapshot(client))
             return result
 
         result["received"] += 1
@@ -3305,6 +3466,7 @@ def ingest_queue_once(
         if conn is not None:
             conn.commit()
 
+        _apply_retry_stats_delta(result, retry_before, _retry_stats_snapshot(client))
         return result
     finally:
         if conn is not None:
@@ -3328,9 +3490,11 @@ def ingest_history_once(
 ) -> dict[str, Any]:
     state = _load_json(state_path, default={})
     result = _empty_stats(dry_run)
+    retry_before = _retry_stats_snapshot(client)
 
     wrapped_events = client.fetch_history_messages()
     if not wrapped_events:
+        _apply_retry_stats_delta(result, retry_before, _retry_stats_snapshot(client))
         return result
 
     wrapped_events = sorted(wrapped_events, key=_history_sort_key)
@@ -3385,10 +3549,48 @@ def ingest_history_once(
         if conn is not None:
             conn.commit()
 
+        _apply_retry_stats_delta(result, retry_before, _retry_stats_snapshot(client))
         return result
     finally:
         if conn is not None:
             conn.close()
+
+
+def _normalize_chat_history_pagination_mode(raw: Any) -> str:
+    mode = str(raw or "").strip().lower()
+    if mode in {
+        CHAT_HISTORY_PAGINATION_OFF,
+        CHAT_HISTORY_PAGINATION_AUTO,
+        CHAT_HISTORY_PAGINATION_FORCE,
+    }:
+        return mode
+    return CHAT_HISTORY_PAGINATION_OFF
+
+
+def _history_message_id(event: dict[str, Any]) -> str:
+    return _first_non_empty(event.get("idMessage"), event.get("id"), event.get("stanzaId"))
+
+
+def _chat_history_batch_signature(rows_sorted: list[dict[str, Any]]) -> str:
+    ids = [_history_message_id(ev) for ev in rows_sorted if _history_message_id(ev)]
+    if ids:
+        return f"ids:{ids[0]}|{ids[-1]}|{len(ids)}"
+
+    ts_vals = [str(_history_timestamp_raw(ev) or "").strip() for ev in rows_sorted]
+    ts_vals = [x for x in ts_vals if x]
+    if ts_vals:
+        return f"ts:{ts_vals[0]}|{ts_vals[-1]}|{len(rows_sorted)}"
+    return f"rows:{len(rows_sorted)}"
+
+
+def _chat_history_cursor_from_batch(rows_sorted: list[dict[str, Any]]) -> str:
+    # Для getChatHistory(idMessage=...) чаще всего нужен id более старого сообщения.
+    # rows_sorted уже отсортирован по времени ASC.
+    for event in rows_sorted:
+        msg_id = _history_message_id(event)
+        if msg_id:
+            return msg_id
+    return ""
 
 
 def ingest_full_history_once(
@@ -3409,16 +3611,24 @@ def ingest_full_history_once(
     max_messages: int = 2000,
     max_batches_per_chat: int = 20,
     refresh_chat_list: bool = False,
+    chat_history_pagination: str = DEFAULT_CHAT_HISTORY_PAGINATION,
 ) -> dict[str, Any]:
     state = _load_json(state_path, default={})
     result = _empty_stats(dry_run)
+    retry_before = _retry_stats_snapshot(client)
+
+    pagination_mode = _normalize_chat_history_pagination_mode(chat_history_pagination)
+    requested_batches_per_chat = max(1, int(max_batches_per_chat))
+    pagination_enabled = pagination_mode != CHAT_HISTORY_PAGINATION_OFF and requested_batches_per_chat > 1
+    pagination_disabled_reason = ""
+    if pagination_mode == CHAT_HISTORY_PAGINATION_OFF:
+        pagination_disabled_reason = "disabled_by_default_single_slice"
+    elif requested_batches_per_chat <= 1:
+        pagination_disabled_reason = "max_batches_per_chat<=1"
 
     conn: sqlite3.Connection | None = None
     try:
-        if not dry_run:
-            conn = ensure_db(db_path)
-        else:
-            conn = ensure_db(db_path)
+        conn = ensure_db(db_path)
 
         full_state = state.get("full_history") if isinstance(state.get("full_history"), dict) else {}
         if not isinstance(full_state, dict):
@@ -3434,50 +3644,135 @@ def ingest_full_history_once(
                 full_state["chat_order"] = chat_order
                 full_state["current_chat_index"] = 0
 
-        if max_chats > 0:
-            chat_order = chat_order[:max_chats]
-
-        if not chat_order:
-            state["last_source_mode"] = SOURCE_CHAT_HISTORY
-            state["last_run_utc"] = dt.datetime.now(tz=dt.timezone.utc).isoformat()
-            state["full_history"] = full_state
-            _save_json(state_path, state)
-            return result
-
         cursors = full_state.get("chat_cursors") if isinstance(full_state.get("chat_cursors"), dict) else {}
         completed = set(str(x).strip() for x in (full_state.get("completed_chats") or []) if str(x).strip())
+        problematic_chats = full_state.get("problematic_chats") if isinstance(full_state.get("problematic_chats"), dict) else {}
+        pagination_unavailable_chats = set(
+            str(x).strip()
+            for x in (full_state.get("pagination_unavailable_chats") or [])
+            if str(x).strip()
+        )
+
+        def save_checkpoint(current_idx: int, current_chat_id: str, last_cursor: str) -> None:
+            full_state["chat_order"] = chat_order
+            full_state["chat_cursors"] = cursors
+            full_state["completed_chats"] = sorted(completed)
+            full_state["problematic_chats"] = problematic_chats
+            full_state["pagination_unavailable_chats"] = sorted(pagination_unavailable_chats)
+            full_state["current_chat_index"] = max(0, current_idx)
+            full_state["current_chat_id"] = current_chat_id
+            full_state["last_batch_cursor"] = last_cursor
+            full_state["diag"] = {
+                "paginationMode": pagination_mode,
+                "paginationEnabled": bool(pagination_enabled),
+                "paginationDisabledReason": pagination_disabled_reason,
+                "paginationUnavailableChats": sorted(pagination_unavailable_chats),
+                "chatsProcessed": int(result.get("chats_processed") or 0),
+                "chatsEmpty": int(result.get("chats_empty") or 0),
+                "chatsNonEmpty": int(result.get("chats_non_empty") or 0),
+                "httpRetriesTotal": int(result.get("http_retries_total") or 0),
+                "httpRetries429": int(result.get("http_retries_429") or 0),
+                "httpRetries5xx": int(result.get("http_retries_5xx") or 0),
+                "httpRetriesNetwork": int(result.get("http_retries_network") or 0),
+            }
+            full_state["updated_at"] = dt.datetime.now(tz=dt.timezone.utc).isoformat()
+            state["full_history"] = full_state
+            state["last_source_mode"] = SOURCE_CHAT_HISTORY
+            state["last_run_utc"] = full_state["updated_at"]
+            _save_json(state_path, state)
+
+        if not chat_order:
+            _apply_retry_stats_delta(result, retry_before, _retry_stats_snapshot(client))
+            save_checkpoint(current_idx=0, current_chat_id="", last_cursor="")
+            return result
+
         current_idx = int(full_state.get("current_chat_index") or 0)
+        start_idx = max(0, current_idx)
+
+        while start_idx < len(chat_order) and chat_order[start_idx] in completed:
+            start_idx += 1
+
+        if start_idx >= len(chat_order):
+            _apply_retry_stats_delta(result, retry_before, _retry_stats_snapshot(client))
+            save_checkpoint(current_idx=max(0, len(chat_order) - 1), current_chat_id="", last_cursor="")
+            return result
+
+        if max_chats > 0:
+            end_idx = min(len(chat_order), start_idx + int(max_chats))
+        else:
+            end_idx = len(chat_order)
 
         batch_size = max(1, min(1000, int(history_batch_size)))
         limit_messages = max(1, int(max_messages))
-        limit_batches = max(1, int(max_batches_per_chat))
+        effective_batches_limit = requested_batches_per_chat if pagination_enabled else 1
 
         processed_total = 0
         processed_chat_ids: list[str] = []
 
-        for idx in range(current_idx, len(chat_order)):
+        for idx in range(start_idx, end_idx):
             if processed_total >= limit_messages:
                 break
 
             chat_id = chat_order[idx]
-            if not chat_id:
-                continue
-            if chat_id in completed:
+            if not chat_id or chat_id in completed:
                 continue
 
+            result["chats_processed"] += 1
             processed_chat_ids.append(chat_id)
-            cursor = str(cursors.get(chat_id) or "").strip()
-            batches = 0
-            chat_inserted = 0
 
-            while batches < limit_batches and processed_total < limit_messages:
-                rows = client.get_chat_history(chat_id=chat_id, count=batch_size, id_message=cursor)
+            cursor = str(cursors.get(chat_id) or "").strip()
+            batches_done = 0
+            seen_signatures: set[str] = set()
+            chat_had_rows = False
+
+            while batches_done < effective_batches_limit and processed_total < limit_messages:
+                use_cursor = pagination_enabled and batches_done > 0
+                rows = client.get_chat_history(
+                    chat_id=chat_id,
+                    count=batch_size,
+                    id_message=cursor,
+                    use_id_message=use_cursor,
+                )
+
                 if not rows:
+                    if not chat_had_rows:
+                        result["chats_empty"] += 1
                     completed.add(chat_id)
                     break
 
-                rows_sorted = sorted(rows, key=lambda ev: (_iso_to_epoch(_history_timestamp_raw(ev)) or 0.0, _first_non_empty(ev.get("idMessage"), ev.get("id"))))
-                newest_id = ""
+                chat_had_rows = True
+                if batches_done == 0:
+                    result["chats_non_empty"] += 1
+
+                rows_sorted = sorted(
+                    rows,
+                    key=lambda ev: (
+                        _iso_to_epoch(_history_timestamp_raw(ev)) or 0.0,
+                        _history_message_id(ev),
+                    ),
+                )
+
+                current_signature = _chat_history_batch_signature(rows_sorted)
+
+                if use_cursor and current_signature in seen_signatures:
+                    completed.add(chat_id)
+                    if chat_id not in pagination_unavailable_chats:
+                        pagination_unavailable_chats.add(chat_id)
+                        result["pagination_unavailable_chats"] += 1
+                    problematic_chats[chat_id] = {
+                        "reason": "pagination_unavailable_repeated_slice",
+                        "cursor": cursor,
+                        "batches": int(batches_done + 1),
+                        "batch_size": int(batch_size),
+                        "rows_in_last_batch": int(len(rows_sorted)),
+                        "updated_at": dt.datetime.now(tz=dt.timezone.utc).isoformat(),
+                    }
+                    logging.warning(
+                        "Pagination seems unsupported for chatId=%s; same slice repeated (cursor=%s)",
+                        chat_id,
+                        cursor,
+                    )
+                    break
 
                 for event in rows_sorted:
                     if processed_total >= limit_messages:
@@ -3505,54 +3800,69 @@ def ingest_full_history_once(
                             since_filter=since_filter,
                         )
                         processed_total += 1
-                        msg_id = _first_non_empty(event.get("idMessage"), event.get("id"), event.get("stanzaId"))
-                        if msg_id:
-                            newest_id = msg_id
                     except Exception:
                         result["errors"] += 1
                         logging.exception("Ошибка обработки full-history сообщения chatId=%s", chat_id)
 
-                batches += 1
+                batches_done += 1
                 result["received"] += len(rows_sorted)
 
-                if newest_id:
-                    cursor = newest_id
+                seen_signatures.add(current_signature)
+
+                next_cursor = _chat_history_cursor_from_batch(rows_sorted)
+                if next_cursor:
+                    cursor = next_cursor
                     cursors[chat_id] = cursor
 
-                # checkpoint после каждого батча
-                full_state["chat_cursors"] = cursors
-                full_state["current_chat_index"] = idx
-                full_state["current_chat_id"] = chat_id
-                full_state["last_batch_cursor"] = cursor
-                full_state["completed_chats"] = sorted(completed)
-                full_state["updated_at"] = dt.datetime.now(tz=dt.timezone.utc).isoformat()
-                state["full_history"] = full_state
-                state["last_source_mode"] = SOURCE_CHAT_HISTORY
-                state["last_run_utc"] = full_state["updated_at"]
-                _save_json(state_path, state)
+                save_checkpoint(current_idx=idx, current_chat_id=chat_id, last_cursor=cursor)
 
-                if not newest_id:
-                    completed.add(chat_id)
+                if processed_total >= limit_messages:
                     break
 
                 if len(rows_sorted) < batch_size:
                     completed.add(chat_id)
                     break
 
-                chat_inserted += len(rows_sorted)
+                if not pagination_enabled:
+                    completed.add(chat_id)
+                    break
+
+                if not cursor:
+                    completed.add(chat_id)
+                    if pagination_mode in {CHAT_HISTORY_PAGINATION_AUTO, CHAT_HISTORY_PAGINATION_FORCE}:
+                        if chat_id not in pagination_unavailable_chats:
+                            pagination_unavailable_chats.add(chat_id)
+                            result["pagination_unavailable_chats"] += 1
+                        problematic_chats[chat_id] = {
+                            "reason": "pagination_unavailable_no_cursor",
+                            "batches": int(batches_done),
+                            "batch_size": int(batch_size),
+                            "rows_in_last_batch": int(len(rows_sorted)),
+                            "updated_at": dt.datetime.now(tz=dt.timezone.utc).isoformat(),
+                        }
+                    break
+
+            if chat_id not in completed and batches_done >= effective_batches_limit:
+                completed.add(chat_id)
+                if pagination_enabled and processed_total < limit_messages:
+                    problematic_chats[chat_id] = {
+                        "reason": "max_batches_per_chat_reached",
+                        "cursor": cursor,
+                        "batches": int(batches_done),
+                        "batch_size": int(batch_size),
+                        "updated_at": dt.datetime.now(tz=dt.timezone.utc).isoformat(),
+                    }
 
             if chat_id in completed:
                 full_state["current_chat_index"] = min(idx + 1, len(chat_order) - 1)
 
-        full_state["chat_order"] = chat_order
-        full_state["chat_cursors"] = cursors
-        full_state["completed_chats"] = sorted(completed)
         full_state["last_chat_ids_touched"] = processed_chat_ids
-        full_state["updated_at"] = dt.datetime.now(tz=dt.timezone.utc).isoformat()
-        state["full_history"] = full_state
-        state["last_source_mode"] = SOURCE_CHAT_HISTORY
-        state["last_run_utc"] = full_state["updated_at"]
-        _save_json(state_path, state)
+        _apply_retry_stats_delta(result, retry_before, _retry_stats_snapshot(client))
+        save_checkpoint(
+            current_idx=int(full_state.get("current_chat_index") or start_idx),
+            current_chat_id=str(full_state.get("current_chat_id") or ""),
+            last_cursor=str(full_state.get("last_batch_cursor") or ""),
+        )
 
         if conn is not None:
             conn.commit()
@@ -3561,7 +3871,6 @@ def ingest_full_history_once(
     finally:
         if conn is not None:
             conn.close()
-
 
 def ingest_once_by_source(
     client: GreenApiClient,
@@ -3584,6 +3893,7 @@ def ingest_once_by_source(
     full_history_max_messages: int = 2000,
     full_history_max_batches_per_chat: int = 20,
     full_history_refresh_chat_list: bool = False,
+    full_history_chat_pagination: str = DEFAULT_CHAT_HISTORY_PAGINATION,
 ) -> dict[str, Any]:
     source_mode = str(source or SOURCE_AUTO).strip().lower()
 
@@ -3640,6 +3950,7 @@ def ingest_once_by_source(
             max_messages=full_history_max_messages,
             max_batches_per_chat=full_history_max_batches_per_chat,
             refresh_chat_list=full_history_refresh_chat_list,
+            chat_history_pagination=full_history_chat_pagination,
         )
 
     queue_stats = ingest_queue_once(
@@ -3708,6 +4019,7 @@ def ingest_batch(
     full_history_max_messages: int = 2000,
     full_history_max_batches_per_chat: int = 20,
     full_history_refresh_chat_list: bool = False,
+    full_history_chat_pagination: str = DEFAULT_CHAT_HISTORY_PAGINATION,
 ) -> dict[str, Any]:
     n = max(1, int(max_events))
     source_mode = str(source or SOURCE_AUTO).strip().lower()
@@ -3750,6 +4062,7 @@ def ingest_batch(
             max_messages=full_history_max_messages,
             max_batches_per_chat=full_history_max_batches_per_chat,
             refresh_chat_list=full_history_refresh_chat_list,
+            chat_history_pagination=full_history_chat_pagination,
         )
 
     for _ in range(n):
@@ -3814,6 +4127,7 @@ def run_loop(
     keep_media_files: bool,
     since_filter: SinceFilter | None,
     source: str = SOURCE_AUTO,
+    chat_history_pagination: str = DEFAULT_CHAT_HISTORY_PAGINATION,
 ) -> None:
     i = 0
     total_received = 0
@@ -3881,6 +4195,7 @@ def run_loop(
                     max_messages=history_limit,
                     max_batches_per_chat=20,
                     refresh_chat_list=False,
+                    chat_history_pagination=chat_history_pagination,
                 )
             else:
                 queue_stats = ingest_queue_once(
@@ -3956,6 +4271,10 @@ def _build_client_from_env() -> GreenApiClient:
         id_instance=id_instance,
         api_token=api_token,
         http_timeout_sec=DEFAULT_HTTP_TIMEOUT,
+        http_max_retries=DEFAULT_HTTP_MAX_RETRIES,
+        http_backoff_base_sec=DEFAULT_HTTP_BACKOFF_BASE_SEC,
+        http_backoff_max_sec=DEFAULT_HTTP_BACKOFF_MAX_SEC,
+        http_backoff_jitter_sec=DEFAULT_HTTP_BACKOFF_JITTER_SEC,
     )
 
 
@@ -3991,6 +4310,15 @@ def main() -> None:
         help="Источник событий: queue | history | chat-history | auto",
     )
     common.add_argument(
+        "--chat-history-pagination",
+        choices=[CHAT_HISTORY_PAGINATION_OFF, CHAT_HISTORY_PAGINATION_AUTO, CHAT_HISTORY_PAGINATION_FORCE],
+        default=DEFAULT_CHAT_HISTORY_PAGINATION,
+        help=(
+            "Пагинация getChatHistory по idMessage: "
+            "off=безопасный single-slice-per-chat, auto=пытаться и auto-stop при повторе, force=всегда пытаться"
+        ),
+    )
+    common.add_argument(
         "--since",
         type=str,
         default="",
@@ -4017,7 +4345,7 @@ def main() -> None:
     p_full.add_argument("--history-batch-size", type=int, default=100, help="Размер батча GetChatHistory (реком. 50-200)")
     p_full.add_argument("--max-chats", type=int, default=20, help="Сколько чатов обрабатывать за запуск (0=без лимита)")
     p_full.add_argument("--max-messages", type=int, default=2000, help="Лимит сообщений за запуск")
-    p_full.add_argument("--max-batches-per-chat", type=int, default=20, help="Лимит батчей на чат за запуск")
+    p_full.add_argument("--max-batches-per-chat", type=int, default=20, help="Лимит батчей на чат за запуск (используется при --chat-history-pagination != off)")
     p_full.add_argument("--refresh-chat-list", action="store_true", help="Пересобрать список чатов (API + DB + journals)")
 
     p_run = sub.add_parser("run", parents=[common], help="Запустить polling")
@@ -4063,6 +4391,7 @@ def main() -> None:
             full_history_max_messages=max(1, int(args.max_events if args.max_events is not None else 2000)),
             full_history_max_batches_per_chat=20,
             full_history_refresh_chat_list=False,
+            full_history_chat_pagination=str(args.chat_history_pagination or DEFAULT_CHAT_HISTORY_PAGINATION).strip().lower(),
         )
         print(json.dumps(stats, ensure_ascii=False))
         return
@@ -4086,6 +4415,7 @@ def main() -> None:
             max_messages=max(1, int(args.max_messages)),
             max_batches_per_chat=max(1, int(args.max_batches_per_chat)),
             refresh_chat_list=bool(args.refresh_chat_list),
+            chat_history_pagination=str(args.chat_history_pagination or DEFAULT_CHAT_HISTORY_PAGINATION).strip().lower(),
         )
         print(json.dumps(stats, ensure_ascii=False))
         return
@@ -4109,6 +4439,7 @@ def main() -> None:
             keep_media_files=keep_media_files,
             since_filter=since_filter,
             source=str(args.source or SOURCE_AUTO).strip().lower(),
+            chat_history_pagination=str(args.chat_history_pagination or DEFAULT_CHAT_HISTORY_PAGINATION).strip().lower(),
         )
 
 

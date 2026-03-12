@@ -107,6 +107,16 @@ OPENCLAW_CONTENT_ANALYZE_TIMEOUT_SEC=120
 OPENCLAW_GATEWAY_PASSWORD=
 OPENCLAW_GATEWAY_TOKEN=
 
+# HTTP retry/backoff (429/5xx/network)
+GREENAPI_HTTP_TIMEOUT_SEC=45
+GREENAPI_HTTP_MAX_RETRIES=5
+GREENAPI_HTTP_BACKOFF_BASE_SEC=0.8
+GREENAPI_HTTP_BACKOFF_MAX_SEC=20
+GREENAPI_HTTP_BACKOFF_JITTER_SEC=0.4
+
+# chat-history pagination policy
+GREENAPI_CHAT_HISTORY_PAGINATION=off  # off|auto|force
+
 GREENAPI_PDF_MAX_PAGES=20
 GREENAPI_TEXT_ANALYZE_MAX_BYTES=8388608
 GREENAPI_TEXT_ANALYZE_MAX_CHARS=2000000
@@ -174,8 +184,9 @@ python3 scripts/greenapi_ingest.py run --source auto --poll-sleep 0.5 --max-even
 - пытается взять список чатов из API (`getChats`),
 - если API списка недоступно — использует known peers из БД,
 - дополнительно добирает кандидатов из journals (`lastIncoming/lastOutgoing`),
-- для каждого chatId запрашивает `getChatHistory` батчами,
-- сохраняет checkpoint в state (`full_history.chat_cursors/current_chat_index/current_chat_id`).
+- по умолчанию работает в **safe single-slice-per-chat** режиме (без `idMessage` пагинации),
+- при включении пагинации (`--chat-history-pagination auto|force`) использует `idMessage` best-effort и авто-останавливается на повторяющемся срезе,
+- сохраняет checkpoint в state (`full_history.chat_cursors/current_chat_index/current_chat_id`) + diag (`full_history.diag`) со счётчиками processed/empty/non-empty и HTTP retry (в т.ч. 429).
 
 ### Базовый безопасный прод-батч
 
@@ -185,7 +196,7 @@ python3 scripts/greenapi_ingest.py ingest-full-history \
   --history-batch-size 100 \
   --max-chats 10 \
   --max-messages 1000 \
-  --max-batches-per-chat 10 \
+  --chat-history-pagination off \
   --refresh-chat-list \
   --verbose
 ```
@@ -200,7 +211,7 @@ python3 scripts/greenapi_ingest.py ingest-full-history \
   --history-batch-size 100 \
   --max-chats 10 \
   --max-messages 1000 \
-  --max-batches-per-chat 10 \
+  --chat-history-pagination off \
   --verbose
 ```
 
@@ -212,9 +223,16 @@ python3 scripts/greenapi_ingest.py ingest-full-history \
   --history-batch-size 50 \
   --max-chats 5 \
   --max-messages 300 \
+  --chat-history-pagination auto \
   --max-batches-per-chat 4 \
   --verbose
 ```
+
+`--chat-history-pagination` режимы:
+
+- `off` (default): без `idMessage`, один срез на чат (безопасно против loop)
+- `auto`: пробует пагинацию, но отключает её для чата при повторяющемся срезе
+- `force`: всегда пытается пагинировать до лимитов (для отладки)
 
 ## Verify text-first
 
