@@ -77,6 +77,21 @@ GREENAPI_TRANSCRIBE_MODEL=whisper-1
 
 `GREENAPI_KEEP_MEDIA_FILES=0` → временно скачанный файл удаляется после обработки.
 
+### 7) History-only без скачивания media
+
+Для быстрого backfill истории без попыток download/transcribe/describe используйте CLI-флаг:
+
+```bash
+--no-download-media
+```
+
+Что меняется:
+
+- media бинарники вообще не скачиваются;
+- transcript / image-description / document-analysis не запускаются;
+- в `messages.text` остаётся исходный текст/caption, а если его нет — компактные media metadata;
+- в `raw_json.waArchiveIngestDiag.mediaDownload` пишется `skipped=true, reason=no_download_media_mode`.
+
 ## Диагностика в `raw_json.waArchiveIngestDiag`
 
 Основные блоки:
@@ -113,6 +128,7 @@ GREENAPI_HTTP_MAX_RETRIES=5
 GREENAPI_HTTP_BACKOFF_BASE_SEC=0.8
 GREENAPI_HTTP_BACKOFF_MAX_SEC=20
 GREENAPI_HTTP_BACKOFF_JITTER_SEC=0.4
+GREENAPI_HTTP_MIN_INTERVAL_SEC=1.05  # hard pacing per request
 
 # chat-history pagination policy
 GREENAPI_CHAT_HISTORY_PAGINATION=off  # off|auto|force
@@ -200,6 +216,11 @@ python3 scripts/greenapi_ingest.py ingest-full-history \
   --refresh-chat-list \
   --verbose
 ```
+
+Для history-only прогона добавьте `--no-download-media` (обычно вместе с `--no-transcribe-audio --no-describe-images`).
+
+Для строгого AUDIO_ONLY режима используйте: `--no-describe-images --no-analyze-docs`.
+Тогда будет идти только транскрибация аудио (доки/картинки пропускаются с diag reason `disabled_by_flag_no_analyze_docs`).
 
 ### Догонять порциями (resume с checkpoint)
 

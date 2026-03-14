@@ -91,6 +91,7 @@ DEFAULT_HTTP_BACKOFF_MAX_SEC = max(
     float(os.getenv("GREENAPI_HTTP_BACKOFF_MAX_SEC", "20")),
 )
 DEFAULT_HTTP_BACKOFF_JITTER_SEC = max(0.0, float(os.getenv("GREENAPI_HTTP_BACKOFF_JITTER_SEC", "0.4")))
+DEFAULT_HTTP_MIN_INTERVAL_SEC = max(0.0, float(os.getenv("GREENAPI_HTTP_MIN_INTERVAL_SEC", "1.05")))
 
 SOURCE_QUEUE = "queue"
 SOURCE_HISTORY = "history"
@@ -345,6 +346,7 @@ class GreenApiClient:
         http_backoff_base_sec: float = DEFAULT_HTTP_BACKOFF_BASE_SEC,
         http_backoff_max_sec: float = DEFAULT_HTTP_BACKOFF_MAX_SEC,
         http_backoff_jitter_sec: float = DEFAULT_HTTP_BACKOFF_JITTER_SEC,
+        http_min_interval_sec: float = DEFAULT_HTTP_MIN_INTERVAL_SEC,
     ) -> None:
         self.api_url = api_url.rstrip("/")
         self.media_url = media_url.rstrip("/")
@@ -355,6 +357,8 @@ class GreenApiClient:
         self.http_backoff_base_sec = max(0.05, float(http_backoff_base_sec))
         self.http_backoff_max_sec = max(self.http_backoff_base_sec, float(http_backoff_max_sec))
         self.http_backoff_jitter_sec = max(0.0, float(http_backoff_jitter_sec))
+        self.http_min_interval_sec = max(0.0, float(http_min_interval_sec))
+        self._next_request_not_before = 0.0
         self._retry_stats: dict[str, int] = {
             "retries_total": 0,
             "retries_429": 0,
@@ -409,6 +413,12 @@ class GreenApiClient:
         req_headers = dict(headers or {})
 
         for attempt in range(self.http_max_retries + 1):
+            if self.http_min_interval_sec > 0:
+                now_monotonic = time.monotonic()
+                if now_monotonic < self._next_request_not_before:
+                    time.sleep(self._next_request_not_before - now_monotonic)
+                self._next_request_not_before = time.monotonic() + self.http_min_interval_sec
+
             req = urllib.request.Request(url, headers=req_headers, data=data, method=method)
             try:
                 with urllib.request.urlopen(req, timeout=self.http_timeout_sec) as resp:
@@ -1264,6 +1274,12 @@ def _build_media_meta_text(meta: dict[str, Any], suffix: str = "") -> str:
 def _is_media_placeholder_text(text: str) -> bool:
     t = str(text or "").strip()
     return bool(t and t.startswith("<media:") and t.endswith(">"))
+
+
+def _ensure_media_text_from_metadata(row: dict[str, Any], meta: dict[str, Any], suffix: str = "") -> None:
+    current = str(row.get("text") or "").strip()
+    if not current or _is_media_placeholder_text(current):
+        row["text"] = _build_media_meta_text(meta, suffix=suffix)
 
 
 def _set_image_description_failed_text(row: dict[str, Any], marker: str = "[image description failed]") -> None:
@@ -2835,6 +2851,8 @@ def _enrich_media_and_transcript(
     describe_images: bool,
     describe_model: str,
     keep_media_files: bool,
+    download_media: bool,
+    no_analyze_docs: bool,
 ) -> dict[str, Any]:
     meta = row.get("_media_meta") if isinstance(row.get("_media_meta"), dict) else {}
     payload = row.get("_payload") if isinstance(row.get("_payload"), dict) else {}
@@ -2861,7 +2879,9 @@ def _enrich_media_and_transcript(
 
     diag["textFirstPolicy"] = {
         "keepMediaFiles": bool(keep_media_files),
+        "downloadMedia": bool(download_media),
         "describeImages": bool(describe_images),
+        "noAnalyzeDocs": bool(no_analyze_docs),
         "transcribeAudio": bool(transcribe_audio),
         "transcribeModel": str(transcribe_model or DEFAULT_TRANSCRIBE_MODEL),
         "transcribeOpenAiFallbackModel": OPENAI_TRANSCRIBE_FALLBACK_MODEL,
@@ -2873,8 +2893,15 @@ def _enrich_media_and_transcript(
         "pdfMaxPages": int(DEFAULT_PDF_MAX_PAGES),
     }
 
+    media_download_skipped = bool(needs_download and not download_media)
     media_info: dict[str, Any] | None = None
-    if needs_download:
+    if media_download_skipped:
+        diag["mediaDownload"] = {
+            "ok": False,
+            "skipped": True,
+            "reason": "no_download_media_mode",
+        }
+    elif needs_download:
         media_info = download_media_file(client=client, row=row, probe=probe, media_root=media_dir)
         if media_info:
             diag["mediaDownload"] = media_info
@@ -2886,6 +2913,57 @@ def _enrich_media_and_transcript(
             "skipped": True,
             "reason": "text-first: unsupported media kind for deep analysis",
         }
+
+    if media_download_skipped:
+        if content_kind == "audio":
+            diag["transcription"] = {
+                "ok": False,
+                "skipped": True,
+                "reason": "no_download_media_mode",
+            }
+        elif content_kind == "image":
+            diag["imageDescription"] = {
+                "ok": False,
+                "skipped": True,
+                "reason": "no_download_media_mode",
+                "pending_reprocess": False,
+            }
+            diag["contentAnalysis"] = {
+                "ok": False,
+                "kind": "image",
+                "skipped": True,
+                "reason": "no_download_media_mode",
+                "pending_reprocess": False,
+            }
+        elif content_kind in {"pdf", "text", "office"}:
+            diag["documentAnalysis"] = {
+                "ok": False,
+                "kind": content_kind,
+                "skipped": True,
+                "reason": "no_download_media_mode",
+                "pending_reprocess": False,
+            }
+            diag["contentAnalysis"] = {
+                "ok": False,
+                "kind": content_kind,
+                "skipped": True,
+                "reason": "no_download_media_mode",
+                "pending_reprocess": False,
+            }
+
+        _ensure_media_text_from_metadata(row, meta, suffix="download_skipped")
+        diag["mediaStorage"] = {
+            "policy": "text-first",
+            "keepMediaFiles": bool(keep_media_files),
+            "binaryStored": False,
+            "binaryDeleted": False,
+            "binaryPath": "",
+            "note": "download_skipped_by_flag",
+        }
+        raw_obj["waArchiveIngestDiag"] = diag
+        row["raw_obj"] = raw_obj
+        row["raw_json"] = json.dumps(raw_obj, ensure_ascii=False)
+        return result
 
     if isinstance(media_info, dict) and media_info.get("ok"):
         result["media_downloaded"] = 1
@@ -3002,7 +3080,18 @@ def _enrich_media_and_transcript(
             }
 
     elif content_kind == "pdf":
-        if media_path is None:
+        if no_analyze_docs:
+            diag["documentAnalysis"] = {
+                "ok": False,
+                "kind": "pdf",
+                "skipped": True,
+                "reason": "disabled_by_flag_no_analyze_docs",
+                "pending_reprocess": False,
+            }
+            current = str(row.get("text") or "").strip()
+            if not current or (current.startswith("<media:") and current.endswith(">")):
+                row["text"] = _build_media_meta_text(meta, suffix="docs_skipped")
+        elif media_path is None:
             diag["documentAnalysis"] = {
                 "ok": False,
                 "kind": "pdf",
@@ -3060,7 +3149,18 @@ def _enrich_media_and_transcript(
                     _set_document_failed_text(row, "[pdf analysis failed]")
 
     elif content_kind == "text":
-        if media_path is None:
+        if no_analyze_docs:
+            diag["documentAnalysis"] = {
+                "ok": False,
+                "kind": "text",
+                "skipped": True,
+                "reason": "disabled_by_flag_no_analyze_docs",
+                "pending_reprocess": False,
+            }
+            current = str(row.get("text") or "").strip()
+            if not current or (current.startswith("<media:") and current.endswith(">")):
+                row["text"] = _build_media_meta_text(meta, suffix="docs_skipped")
+        elif media_path is None:
             diag["documentAnalysis"] = {
                 "ok": False,
                 "kind": "text",
@@ -3097,7 +3197,18 @@ def _enrich_media_and_transcript(
                 _set_document_failed_text(row, "[text extraction failed]")
 
     elif content_kind == "office":
-        if media_path is None:
+        if no_analyze_docs:
+            diag["documentAnalysis"] = {
+                "ok": False,
+                "kind": "office",
+                "skipped": True,
+                "reason": "disabled_by_flag_no_analyze_docs",
+                "pending_reprocess": False,
+            }
+            current = str(row.get("text") or "").strip()
+            if not current or (current.startswith("<media:") and current.endswith(">")):
+                row["text"] = _build_media_meta_text(meta, suffix="docs_skipped")
+        elif media_path is None:
             diag["documentAnalysis"] = {
                 "ok": False,
                 "kind": "office",
@@ -3347,6 +3458,8 @@ def _process_normalized_row(
     describe_images: bool,
     describe_model: str,
     keep_media_files: bool,
+    download_media: bool,
+    no_analyze_docs: bool,
     since_filter: SinceFilter | None,
 ) -> None:
     if normalized is None:
@@ -3379,6 +3492,8 @@ def _process_normalized_row(
         describe_images=bool(describe_images),
         describe_model=describe_model,
         keep_media_files=bool(keep_media_files),
+        download_media=bool(download_media),
+        no_analyze_docs=bool(no_analyze_docs),
     )
     result["media_downloaded"] += int(enrich.get("media_downloaded") or 0)
     result["transcribed"] += int(enrich.get("transcribed") or 0)
@@ -3409,6 +3524,8 @@ def ingest_queue_once(
     describe_images: bool = True,
     describe_model: str = DEFAULT_DESCRIBE_MODEL,
     keep_media_files: bool = DEFAULT_KEEP_MEDIA_FILES,
+    download_media: bool = True,
+    no_analyze_docs: bool = False,
     since_filter: SinceFilter | None = None,
 ) -> dict[str, Any]:
     state = _load_json(state_path, default={})
@@ -3443,6 +3560,8 @@ def ingest_queue_once(
                 describe_images=describe_images,
                 describe_model=describe_model,
                 keep_media_files=keep_media_files,
+                download_media=download_media,
+                no_analyze_docs=no_analyze_docs,
                 since_filter=since_filter,
             )
         except Exception:
@@ -3485,6 +3604,8 @@ def ingest_history_once(
     describe_images: bool = True,
     describe_model: str = DEFAULT_DESCRIBE_MODEL,
     keep_media_files: bool = DEFAULT_KEEP_MEDIA_FILES,
+    download_media: bool = True,
+    no_analyze_docs: bool = False,
     since_filter: SinceFilter | None = None,
     max_events: int = 50,
 ) -> dict[str, Any]:
@@ -3530,6 +3651,8 @@ def ingest_history_once(
                     describe_images=describe_images,
                     describe_model=describe_model,
                     keep_media_files=keep_media_files,
+                    download_media=download_media,
+                    no_analyze_docs=no_analyze_docs,
                     since_filter=since_filter,
                 )
             except Exception:
@@ -3605,6 +3728,8 @@ def ingest_full_history_once(
     describe_images: bool = True,
     describe_model: str = DEFAULT_DESCRIBE_MODEL,
     keep_media_files: bool = DEFAULT_KEEP_MEDIA_FILES,
+    download_media: bool = True,
+    no_analyze_docs: bool = False,
     since_filter: SinceFilter | None = None,
     history_batch_size: int = 100,
     max_chats: int = 20,
@@ -3797,6 +3922,8 @@ def ingest_full_history_once(
                             describe_images=describe_images,
                             describe_model=describe_model,
                             keep_media_files=keep_media_files,
+                            download_media=download_media,
+                            no_analyze_docs=no_analyze_docs,
                             since_filter=since_filter,
                         )
                         processed_total += 1
@@ -3885,6 +4012,7 @@ def ingest_once_by_source(
     describe_images: bool,
     describe_model: str,
     keep_media_files: bool,
+    download_media: bool,
     since_filter: SinceFilter | None,
     source: str,
     max_history_events: int,
@@ -3911,6 +4039,8 @@ def ingest_once_by_source(
             describe_images=describe_images,
             describe_model=describe_model,
             keep_media_files=keep_media_files,
+            download_media=download_media,
+            no_analyze_docs=no_analyze_docs,
             since_filter=since_filter,
         )
 
@@ -3927,6 +4057,8 @@ def ingest_once_by_source(
             describe_images=describe_images,
             describe_model=describe_model,
             keep_media_files=keep_media_files,
+            download_media=download_media,
+            no_analyze_docs=no_analyze_docs,
             since_filter=since_filter,
             max_events=max_history_events,
         )
@@ -3944,6 +4076,8 @@ def ingest_once_by_source(
             describe_images=describe_images,
             describe_model=describe_model,
             keep_media_files=keep_media_files,
+            download_media=download_media,
+            no_analyze_docs=no_analyze_docs,
             since_filter=since_filter,
             history_batch_size=full_history_batch_size,
             max_chats=full_history_max_chats,
@@ -3966,6 +4100,8 @@ def ingest_once_by_source(
         describe_images=describe_images,
         describe_model=describe_model,
         keep_media_files=keep_media_files,
+        download_media=download_media,
+        no_analyze_docs=no_analyze_docs,
         since_filter=since_filter,
     )
 
@@ -3984,6 +4120,8 @@ def ingest_once_by_source(
         describe_images=describe_images,
         describe_model=describe_model,
         keep_media_files=keep_media_files,
+        download_media=download_media,
+        no_analyze_docs=no_analyze_docs,
         since_filter=since_filter,
         max_events=max_history_events,
     )
@@ -4011,6 +4149,8 @@ def ingest_batch(
     describe_images: bool,
     describe_model: str,
     keep_media_files: bool,
+    download_media: bool,
+    no_analyze_docs: bool,
     since_filter: SinceFilter | None,
     max_events: int,
     source: str = SOURCE_AUTO,
@@ -4039,6 +4179,8 @@ def ingest_batch(
             describe_images=describe_images,
             describe_model=describe_model,
             keep_media_files=keep_media_files,
+            download_media=download_media,
+            no_analyze_docs=no_analyze_docs,
             since_filter=since_filter,
             max_events=n,
         )
@@ -4056,6 +4198,8 @@ def ingest_batch(
             describe_images=describe_images,
             describe_model=describe_model,
             keep_media_files=keep_media_files,
+            download_media=download_media,
+            no_analyze_docs=no_analyze_docs,
             since_filter=since_filter,
             history_batch_size=full_history_batch_size,
             max_chats=full_history_max_chats,
@@ -4079,6 +4223,8 @@ def ingest_batch(
             describe_images=describe_images,
             describe_model=describe_model,
             keep_media_files=keep_media_files,
+            download_media=download_media,
+            no_analyze_docs=no_analyze_docs,
             since_filter=since_filter,
         )
         _merge_stats(agg, stats)
@@ -4100,6 +4246,8 @@ def ingest_batch(
             describe_images=describe_images,
             describe_model=describe_model,
             keep_media_files=keep_media_files,
+            download_media=download_media,
+            no_analyze_docs=no_analyze_docs,
             since_filter=since_filter,
             max_events=n,
         )
@@ -4125,6 +4273,8 @@ def run_loop(
     describe_images: bool,
     describe_model: str,
     keep_media_files: bool,
+    download_media: bool,
+    no_analyze_docs: bool,
     since_filter: SinceFilter | None,
     source: str = SOURCE_AUTO,
     chat_history_pagination: str = DEFAULT_CHAT_HISTORY_PAGINATION,
@@ -4158,6 +4308,8 @@ def run_loop(
                     describe_images=describe_images,
                     describe_model=describe_model,
                     keep_media_files=keep_media_files,
+                    download_media=download_media,
+                    no_analyze_docs=no_analyze_docs,
                     since_filter=since_filter,
                 )
             elif source_mode == SOURCE_HISTORY:
@@ -4173,6 +4325,8 @@ def run_loop(
                     describe_images=describe_images,
                     describe_model=describe_model,
                     keep_media_files=keep_media_files,
+                    download_media=download_media,
+                    no_analyze_docs=no_analyze_docs,
                     since_filter=since_filter,
                     max_events=history_limit,
                 )
@@ -4189,6 +4343,8 @@ def run_loop(
                     describe_images=describe_images,
                     describe_model=describe_model,
                     keep_media_files=keep_media_files,
+                    download_media=download_media,
+                    no_analyze_docs=no_analyze_docs,
                     since_filter=since_filter,
                     history_batch_size=max(1, min(200, history_limit)),
                     max_chats=20,
@@ -4211,6 +4367,8 @@ def run_loop(
                     describe_images=describe_images,
                     describe_model=describe_model,
                     keep_media_files=keep_media_files,
+                    download_media=download_media,
+                    no_analyze_docs=no_analyze_docs,
                     since_filter=since_filter,
                 )
                 if int(queue_stats.get("received") or 0) > 0:
@@ -4229,6 +4387,8 @@ def run_loop(
                         describe_images=describe_images,
                         describe_model=describe_model,
                         keep_media_files=keep_media_files,
+                        download_media=download_media,
+                        no_analyze_docs=no_analyze_docs,
                         since_filter=since_filter,
                         max_events=history_limit,
                     )
@@ -4275,6 +4435,7 @@ def _build_client_from_env() -> GreenApiClient:
         http_backoff_base_sec=DEFAULT_HTTP_BACKOFF_BASE_SEC,
         http_backoff_max_sec=DEFAULT_HTTP_BACKOFF_MAX_SEC,
         http_backoff_jitter_sec=DEFAULT_HTTP_BACKOFF_JITTER_SEC,
+        http_min_interval_sec=DEFAULT_HTTP_MIN_INTERVAL_SEC,
     )
 
 
@@ -4326,6 +4487,8 @@ def main() -> None:
     )
     common.add_argument("--no-transcribe-audio", action="store_true", help="Отключить авто-транскрипт voice/audio")
     common.add_argument("--no-describe-images", action="store_true", help="Отключить авто-описание изображений")
+    common.add_argument("--no-analyze-docs", action="store_true", help="Отключить анализ документов (pdf/txt/office)")
+    common.add_argument("--no-download-media", action="store_true", help="History-only режим: не скачивать media бинарники и не запускать их deep-analysis")
     common.add_argument("--keep-media-files", action="store_true", help="Не удалять временно скачанные image/audio файлы")
     common.add_argument(
         "--transcribe-model",
@@ -4363,11 +4526,14 @@ def main() -> None:
 
     transcribe_audio = bool(DEFAULT_TRANSCRIBE_AUDIO) and not bool(args.no_transcribe_audio)
     describe_images = bool(DEFAULT_DESCRIBE_IMAGES) and not bool(args.no_describe_images)
+    no_analyze_docs = bool(args.no_analyze_docs)
     keep_media_files = bool(DEFAULT_KEEP_MEDIA_FILES) or bool(args.keep_media_files)
+    download_media = not bool(args.no_download_media)
 
     if args.dry_run:
         transcribe_audio = False
         describe_images = False
+        download_media = False
 
     if args.cmd == "ingest-once":
         stats = ingest_batch(
@@ -4383,6 +4549,8 @@ def main() -> None:
             describe_images=describe_images,
             describe_model=str(args.describe_model or DEFAULT_DESCRIBE_MODEL),
             keep_media_files=keep_media_files,
+            download_media=download_media,
+            no_analyze_docs=no_analyze_docs,
             since_filter=since_filter,
             max_events=max(1, int(args.max_events if args.max_events is not None else 1)),
             source=str(args.source or SOURCE_AUTO).strip().lower(),
@@ -4409,6 +4577,8 @@ def main() -> None:
             describe_images=describe_images,
             describe_model=str(args.describe_model or DEFAULT_DESCRIBE_MODEL),
             keep_media_files=keep_media_files,
+            download_media=download_media,
+            no_analyze_docs=no_analyze_docs,
             since_filter=since_filter,
             history_batch_size=max(1, int(args.history_batch_size)),
             max_chats=max(0, int(args.max_chats)),
@@ -4437,6 +4607,8 @@ def main() -> None:
             describe_images=describe_images,
             describe_model=str(args.describe_model or DEFAULT_DESCRIBE_MODEL),
             keep_media_files=keep_media_files,
+            download_media=download_media,
+            no_analyze_docs=no_analyze_docs,
             since_filter=since_filter,
             source=str(args.source or SOURCE_AUTO).strip().lower(),
             chat_history_pagination=str(args.chat_history_pagination or DEFAULT_CHAT_HISTORY_PAGINATION).strip().lower(),
