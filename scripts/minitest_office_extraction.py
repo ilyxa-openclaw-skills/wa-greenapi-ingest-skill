@@ -143,6 +143,8 @@ def _run_case(ingest, *, path: Path, row: dict) -> dict:
             describe_images=False,
             describe_model="gpt-4o-mini",
             keep_media_files=False,
+            download_media=True,
+            no_analyze_docs=False,
         )
     finally:
         ingest.download_media_file = orig_download

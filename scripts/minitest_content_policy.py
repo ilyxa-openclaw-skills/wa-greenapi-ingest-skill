@@ -90,6 +90,8 @@ def _run_pdf_case(ingest, *, pages: int) -> dict:
                 describe_images=False,
                 describe_model="gpt-4o-mini",
                 keep_media_files=False,
+                download_media=True,
+                no_analyze_docs=False,
             )
         finally:
             ingest.download_media_file = orig_download
@@ -152,6 +154,8 @@ def _run_text_case(ingest) -> dict:
                 describe_images=False,
                 describe_model="gpt-4o-mini",
                 keep_media_files=False,
+                download_media=True,
+                no_analyze_docs=False,
             )
         finally:
             ingest.download_media_file = orig_download
@@ -196,7 +200,7 @@ def main() -> int:
             and str(pdf_large.get("text")) == "[pdf skipped: too_many_pages]"
         ),
         "text_file_full_analyzed": (
-            text_case.get("text") == text_case.get("source_text")
+            str(text_case.get("text") or "").replace("\r\n", "\n") == text_case.get("source_text")
             and bool(text_case["diag"].get("ok"))
             and text_case["diag"].get("kind") == "text"
             and not bool(text_case["diag"].get("bytesTruncated"))
