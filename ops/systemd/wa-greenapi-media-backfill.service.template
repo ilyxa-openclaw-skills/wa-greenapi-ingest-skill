@@ -1,0 +1,17 @@
+[Unit]
+Description=WhatsApp archive historical media/audio backfill without OpenClaw cron LLM wrapper
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=__SKILL_ROOT__/.env
+
+[Service]
+Type=oneshot
+User=openclaw
+Group=openclaw
+Environment=HOME=/home/openclaw
+Environment=OPENCLAW_HOME=/home/openclaw
+Environment=OPENCLAW_STATE_DIR=/home/openclaw/.openclaw
+EnvironmentFile=-__OPENCLAW_ENV_FILE__
+WorkingDirectory=__SKILL_ROOT__
+ExecStart=/bin/bash __SKILL_ROOT__/scripts/runners/wa_historical_media_backfill.sh
+TimeoutStartSec=900

@@ -15,6 +15,8 @@ readonly TEMPLATES=(
   "wa-greenapi-ingest-queue.timer.template"
   "wa-greenapi-history-reconcile.service.template"
   "wa-greenapi-history-reconcile.timer.template"
+  "wa-greenapi-media-backfill.service.template"
+  "wa-greenapi-media-backfill.timer.template"
   "wa-greenapi-embeddings-backfill.service.template"
   "wa-greenapi-embeddings-backfill.timer.template"
   "wa-greenapi-enrich-media.service.template"
@@ -23,6 +25,7 @@ readonly TEMPLATES=(
 readonly TIMERS=(
   "wa-greenapi-ingest-queue.timer"
   "wa-greenapi-history-reconcile.timer"
+  "wa-greenapi-media-backfill.timer"
   "wa-greenapi-embeddings-backfill.timer"
   "wa-greenapi-enrich-media.timer"
 )

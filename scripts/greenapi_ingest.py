@@ -115,6 +115,7 @@ DEFAULT_HTTP_BACKOFF_MAX_SEC = max(
 )
 DEFAULT_HTTP_BACKOFF_JITTER_SEC = max(0.0, float(os.getenv("GREENAPI_HTTP_BACKOFF_JITTER_SEC", "0.4")))
 DEFAULT_HTTP_MIN_INTERVAL_SEC = max(0.0, float(os.getenv("GREENAPI_HTTP_MIN_INTERVAL_SEC", "1.05")))
+DEFAULT_MEDIA_BACKFILL_BATCH = max(1, int(os.getenv("WA_GREENAPI_MEDIA_BACKFILL_BATCH", "4")))
 
 SOURCE_QUEUE = "queue"
 SOURCE_HISTORY = "history"
@@ -138,6 +139,10 @@ if DEFAULT_CHAT_HISTORY_PAGINATION not in {
 SOURCE_TYPE_QUEUE = "greenapi"
 SOURCE_TYPE_HISTORY = "greenapi-history"
 SOURCE_TYPE_CHAT_HISTORY = "greenapi-chat-history"
+MEDIA_BACKFILL_HISTORY_SOURCE_TYPES = {
+    SOURCE_TYPE_HISTORY,
+    SOURCE_TYPE_CHAT_HISTORY,
+}
 
 URL_KEY_CANDIDATES = {
     "downloadurl",
@@ -3688,6 +3693,458 @@ def _apply_retry_stats_delta(result: dict[str, Any], before: dict[str, int], aft
     result["http_retries_network"] += delta["retries_network"]
 
 
+def _ensure_embeddings_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS embeddings (
+          message_id INTEGER PRIMARY KEY,
+          model TEXT NOT NULL,
+          vector_json TEXT NOT NULL,
+          created_at TEXT DEFAULT (datetime('now'))
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_embeddings_model ON embeddings(model)")
+
+
+def _history_media_backfill_scan_rows(
+    conn: sqlite3.Connection,
+    *,
+    peer: str | None = None,
+) -> list[sqlite3.Row]:
+    normalized_peer = _normalize_chat_id(peer)
+    params: list[Any] = [SOURCE_TYPE_HISTORY, SOURCE_TYPE_CHAT_HISTORY]
+    sql = """
+        SELECT id, ts, direction, peer, text, raw_json, source_line, source_type, source_message_id
+        FROM messages
+        WHERE source_type IN (?, ?)
+          AND (
+            text LIKE '%download_skipped%'
+            OR text LIKE '%transcript_unavailable%'
+            OR raw_json LIKE '%no_download_media_mode%'
+          )
+    """
+    if normalized_peer:
+        sql += " AND peer = ?"
+        params.append(normalized_peer)
+    sql += " ORDER BY id ASC"
+    return list(conn.execute(sql, params))
+
+
+def _row_is_audio_backfill_candidate(row: sqlite3.Row, raw_obj: dict[str, Any]) -> bool:
+    source_type = str(row["source_type"] or "").strip()
+    if source_type not in MEDIA_BACKFILL_HISTORY_SOURCE_TYPES:
+        return False
+
+    diag = raw_obj.get("waArchiveIngestDiag") if isinstance(raw_obj.get("waArchiveIngestDiag"), dict) else {}
+    message_type = str(diag.get("messageType") or "").strip().lower()
+    if not (_is_truthy(diag.get("isAudio")) or "audio" in message_type or "voice" in message_type or "ptt" in message_type):
+        return False
+
+    transcription = diag.get("transcription") if isinstance(diag.get("transcription"), dict) else {}
+    if _is_truthy(transcription.get("ok")):
+        return False
+
+    media_download = diag.get("mediaDownload") if isinstance(diag.get("mediaDownload"), dict) else {}
+    if str(media_download.get("reason") or "").strip() == "no_download_media_mode":
+        return True
+    if str(transcription.get("reason") or "").strip() == "no_download_media_mode":
+        return True
+    if str(transcription.get("error") or "").strip():
+        return True
+
+    text_val = str(row["text"] or "").strip().lower()
+    return "download_skipped" in text_val or "transcript_unavailable" in text_val
+
+
+def _row_is_media_backfill_candidate(
+    row: sqlite3.Row,
+    *,
+    audio_only: bool,
+) -> bool:
+    raw_obj = _safe_json_loads(str(row["raw_json"] or "")) or {}
+    if not raw_obj:
+        return False
+
+    if audio_only:
+        return _row_is_audio_backfill_candidate(row, raw_obj)
+
+    diag = raw_obj.get("waArchiveIngestDiag") if isinstance(raw_obj.get("waArchiveIngestDiag"), dict) else {}
+    media_download = diag.get("mediaDownload") if isinstance(diag.get("mediaDownload"), dict) else {}
+    source_type = str(row["source_type"] or "").strip()
+    return (
+        source_type in MEDIA_BACKFILL_HISTORY_SOURCE_TYPES
+        and str(media_download.get("reason") or "").strip() == "no_download_media_mode"
+    )
+
+
+def _select_history_media_backfill_candidates(
+    conn: sqlite3.Connection,
+    *,
+    batch: int,
+    peer: str | None = None,
+    audio_only: bool,
+) -> list[sqlite3.Row]:
+    out: list[sqlite3.Row] = []
+    for row in _history_media_backfill_scan_rows(conn, peer=peer):
+        if _row_is_media_backfill_candidate(row, audio_only=audio_only):
+            out.append(row)
+            if len(out) >= max(1, int(batch)):
+                break
+    return out
+
+
+def _count_history_media_backfill_candidates(
+    conn: sqlite3.Connection,
+    *,
+    peer: str | None = None,
+    audio_only: bool,
+) -> int:
+    total = 0
+    for row in _history_media_backfill_scan_rows(conn, peer=peer):
+        if _row_is_media_backfill_candidate(row, audio_only=audio_only):
+            total += 1
+    return total
+
+
+def _fallback_archived_normalized_row(
+    archived_row: sqlite3.Row,
+    *,
+    source_type: str,
+    source_message_id: str,
+    raw_obj: dict[str, Any],
+    payload: dict[str, Any],
+    media_meta: dict[str, Any],
+) -> dict[str, Any] | None:
+    if not payload or not media_meta:
+        return None
+
+    row_text = str(archived_row["text"] or "").strip()
+    if not row_text:
+        row_text = _build_media_meta_text(media_meta, suffix="download_skipped")
+
+    ts = str(archived_row["ts"] or "").strip() or _ts_to_iso(payload.get("timestamp"))
+    direction = str(archived_row["direction"] or "").strip().lower()
+    if direction not in {"in", "out"}:
+        direction = _extract_direction(str(payload.get("typeWebhook") or ""), payload)
+
+    peer = str(archived_row["peer"] or "").strip() or _extract_peer(payload, direction)
+    source_line = str(archived_row["source_line"] or "").strip()
+    if not source_line:
+        source_line = json.dumps((raw_obj.get("greenapi") or {}), ensure_ascii=False)[:2000]
+
+    return {
+        "ts": ts,
+        "direction": direction or "in",
+        "peer": peer or "unknown",
+        "text": row_text,
+        "raw_obj": raw_obj,
+        "raw_json": json.dumps(raw_obj, ensure_ascii=False),
+        "source_line": source_line[:2000],
+        "source_type": source_type,
+        "source_message_id": source_message_id,
+        "_payload": payload,
+        "_media_meta": media_meta,
+    }
+
+
+def _rebuild_archived_normalized_row(
+    archived_row: sqlite3.Row,
+    *,
+    client: GreenApiClient,
+) -> dict[str, Any] | None:
+    raw_obj = _safe_json_loads(str(archived_row["raw_json"] or "")) or {}
+    greenapi_obj = raw_obj.get("greenapi") if isinstance(raw_obj.get("greenapi"), dict) else {}
+    if not greenapi_obj:
+        return None
+
+    diag = raw_obj.get("waArchiveIngestDiag") if isinstance(raw_obj.get("waArchiveIngestDiag"), dict) else {}
+    source_type = str(archived_row["source_type"] or "").strip() or SOURCE_TYPE_HISTORY
+    source_message_id = str(archived_row["source_message_id"] or "").strip()
+
+    history_event = greenapi_obj.get("history") if isinstance(greenapi_obj.get("history"), dict) else None
+    if history_event is not None:
+        direction_hint = str(diag.get("historyDirectionHint") or "").strip() or None
+        normalized = normalize_history_event(
+            history_event,
+            media_url=client.media_url,
+            direction_hint=direction_hint,
+            source_type=source_type,
+        )
+        if normalized is not None:
+            normalized["source_message_id"] = source_message_id or normalized.get("source_message_id") or ""
+            normalized["source_type"] = source_type
+            return normalized
+
+        direction = _history_direction(history_event, direction_hint=direction_hint)
+        payload = _build_history_payload(history_event, direction=direction)
+        _, media_meta = _extract_text_and_media_flags(payload)
+        return _fallback_archived_normalized_row(
+            archived_row,
+            source_type=source_type,
+            source_message_id=source_message_id,
+            raw_obj=raw_obj,
+            payload=payload,
+            media_meta=media_meta,
+        )
+
+    normalized = normalize_notification(greenapi_obj, media_url=client.media_url)
+    if normalized is not None:
+        normalized["source_message_id"] = source_message_id or normalized.get("source_message_id") or ""
+        normalized["source_type"] = source_type or normalized.get("source_type") or SOURCE_TYPE_QUEUE
+        return normalized
+
+    payload = greenapi_obj.get("body") if isinstance(greenapi_obj.get("body"), dict) else {}
+    _, media_meta = _extract_text_and_media_flags(payload) if payload else ("", {})
+    return _fallback_archived_normalized_row(
+        archived_row,
+        source_type=source_type or SOURCE_TYPE_QUEUE,
+        source_message_id=source_message_id,
+        raw_obj=raw_obj,
+        payload=payload,
+        media_meta=media_meta,
+    )
+
+
+def _load_message_texts(conn: sqlite3.Connection, message_ids: list[int]) -> dict[int, str]:
+    uniq_ids = sorted({int(x) for x in message_ids if int(x) > 0})
+    if not uniq_ids:
+        return {}
+
+    placeholders = ",".join("?" for _ in uniq_ids)
+    rows = conn.execute(
+        f"SELECT id, text FROM messages WHERE id IN ({placeholders})",
+        uniq_ids,
+    ).fetchall()
+    return {int(row[0]): str(row[1] or "") for row in rows}
+
+
+def _message_ids_for_embedding_invalidation(
+    conn: sqlite3.Connection,
+    *,
+    archived_row_id: int,
+    source_message_id: str,
+) -> list[int]:
+    if source_message_id:
+        rows = conn.execute(
+            "SELECT id FROM messages WHERE source_message_id=? ORDER BY id ASC",
+            (source_message_id,),
+        ).fetchall()
+        out = [int(row[0]) for row in rows if int(row[0]) > 0]
+        if out:
+            return out
+    return [int(archived_row_id)]
+
+
+def _invalidate_embeddings_for_messages(conn: sqlite3.Connection, message_ids: list[int]) -> int:
+    uniq_ids = sorted({int(x) for x in message_ids if int(x) > 0})
+    if not uniq_ids:
+        return 0
+
+    placeholders = ",".join("?" for _ in uniq_ids)
+    cur = conn.execute(
+        f"DELETE FROM embeddings WHERE message_id IN ({placeholders})",
+        uniq_ids,
+    )
+    return int(cur.rowcount or 0)
+
+
+def _update_existing_message_by_id(conn: sqlite3.Connection, row_id: int, row: dict[str, Any]) -> str:
+    existing = conn.execute(
+        """
+        SELECT ts, direction, peer, text, raw_json, source_line, source_message_id
+        FROM messages
+        WHERE id=?
+        LIMIT 1
+        """,
+        (int(row_id),),
+    ).fetchone()
+    if existing is None:
+        return "duplicate"
+
+    old_ts, old_direction, old_peer, old_text, old_raw_json, old_source_line, old_source_message_id = existing
+    new_text = old_text
+    if _should_replace_text(
+        str(old_text or ""),
+        str(row.get("text") or ""),
+        str(old_raw_json or ""),
+        str(row.get("raw_json") or ""),
+    ):
+        new_text = row.get("text")
+
+    new_ts = old_ts or row.get("ts")
+    incoming_direction = str(row.get("direction") or "").strip().lower()
+    new_direction = incoming_direction if incoming_direction in {"in", "out"} else old_direction
+    new_peer = old_peer if str(old_peer or "").strip() not in {"", "unknown"} else row.get("peer")
+    new_raw_json = row.get("raw_json")
+    if _should_preserve_existing_raw_json(
+        str(old_text or ""),
+        str(old_raw_json or ""),
+        str(row.get("text") or ""),
+        str(row.get("raw_json") or ""),
+    ):
+        new_raw_json = old_raw_json
+
+    new_source_line = row.get("source_line")
+    new_source_message_id = str(row.get("source_message_id") or old_source_message_id or "").strip()
+
+    if (
+        new_ts != old_ts
+        or new_direction != old_direction
+        or new_peer != old_peer
+        or new_text != old_text
+        or new_raw_json != old_raw_json
+        or new_source_line != old_source_line
+        or new_source_message_id != str(old_source_message_id or "")
+    ):
+        conn.execute(
+            """
+            UPDATE messages
+            SET ts=?, direction=?, peer=?, text=?, raw_json=?, source_line=?, source_message_id=?
+            WHERE id=?
+            """,
+            (
+                new_ts,
+                new_direction,
+                new_peer,
+                new_text,
+                new_raw_json,
+                new_source_line,
+                new_source_message_id,
+                int(row_id),
+            ),
+        )
+        return "updated"
+
+    return "duplicate"
+
+
+def reprocess_skipped_media_once(
+    client: GreenApiClient,
+    db_path: Path,
+    media_dir: Path,
+    *,
+    batch: int,
+    dry_run: bool = False,
+    transcribe_audio: bool = True,
+    transcribe_model: str = DEFAULT_TRANSCRIBE_MODEL,
+    transcribe_language: str | None = DEFAULT_TRANSCRIBE_LANGUAGE,
+    describe_images: bool = True,
+    describe_model: str = DEFAULT_DESCRIBE_MODEL,
+    keep_media_files: bool = DEFAULT_KEEP_MEDIA_FILES,
+    no_analyze_docs: bool = False,
+    peer: str | None = None,
+    audio_only: bool = False,
+) -> dict[str, Any]:
+    result = _empty_stats(dry_run)
+    result["selected"] = 0
+    result["processed"] = 0
+    result["reconstructed"] = 0
+    result["embeddings_invalidated"] = 0
+    result["remaining_after"] = 0
+
+    conn = ensure_db(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        _ensure_embeddings_table(conn)
+        candidates = _select_history_media_backfill_candidates(
+            conn,
+            batch=max(1, int(batch)),
+            peer=peer,
+            audio_only=bool(audio_only),
+        )
+        result["selected"] = len(candidates)
+
+        if dry_run:
+            for row in candidates:
+                logging.info(
+                    "[dry-run] reprocess candidate: id=%s peer=%s source_message_id=%s text=%s",
+                    row["id"],
+                    row["peer"],
+                    row["source_message_id"],
+                    str(row["text"] or "")[:160],
+                )
+            result["remaining_after"] = _count_history_media_backfill_candidates(
+                conn,
+                peer=peer,
+                audio_only=bool(audio_only),
+            )
+            return result
+
+        for archived_row in candidates:
+            row_id = int(archived_row["id"])
+            source_message_id = str(archived_row["source_message_id"] or "").strip()
+            target_ids_before = _message_ids_for_embedding_invalidation(
+                conn,
+                archived_row_id=row_id,
+                source_message_id=source_message_id,
+            )
+            text_before = _load_message_texts(conn, target_ids_before)
+
+            normalized = _rebuild_archived_normalized_row(archived_row, client=client)
+            if normalized is None:
+                result["errors"] += 1
+                logging.warning("Skipped media backfill could not rebuild archived row id=%s", row_id)
+                continue
+
+            result["reconstructed"] += 1
+            retry_before = _retry_stats_snapshot(client)
+            enrich = _enrich_media_and_transcript(
+                client=client,
+                row=normalized,
+                media_dir=media_dir,
+                transcribe_audio=bool(transcribe_audio),
+                transcribe_model=transcribe_model,
+                transcribe_language=transcribe_language,
+                describe_images=bool(describe_images),
+                describe_model=describe_model,
+                keep_media_files=bool(keep_media_files),
+                download_media=True,
+                no_analyze_docs=bool(no_analyze_docs),
+            )
+            result["media_downloaded"] += int(enrich.get("media_downloaded") or 0)
+            result["transcribed"] += int(enrich.get("transcribed") or 0)
+            result["images_described"] += int(enrich.get("images_described") or 0)
+            result["docs_analyzed"] += int(enrich.get("docs_analyzed") or 0)
+            result["pdf_skipped"] += int(enrich.get("pdf_skipped") or 0)
+            result["media_deleted"] += int(enrich.get("media_deleted") or 0)
+
+            if source_message_id:
+                action = upsert_message(conn, normalized)
+            else:
+                action = _update_existing_message_by_id(conn, row_id, normalized)
+
+            if action == "inserted":
+                result["inserted"] += 1
+            elif action == "updated":
+                result["updated"] += 1
+            else:
+                result["skipped"] += 1
+
+            target_ids_after = _message_ids_for_embedding_invalidation(
+                conn,
+                archived_row_id=row_id,
+                source_message_id=source_message_id,
+            )
+            text_after = _load_message_texts(conn, target_ids_after)
+            text_changed = text_before != text_after
+            if text_changed:
+                result["embeddings_invalidated"] += _invalidate_embeddings_for_messages(conn, target_ids_after)
+
+            conn.commit()
+            _apply_retry_stats_delta(result, retry_before, _retry_stats_snapshot(client))
+            result["processed"] += 1
+
+        result["remaining_after"] = _count_history_media_backfill_candidates(
+            conn,
+            peer=peer,
+            audio_only=bool(audio_only),
+        )
+        return result
+    finally:
+        conn.close()
+
+
 def _process_normalized_row(
     *,
     client: GreenApiClient,
@@ -4780,6 +5237,15 @@ def main() -> None:
     p_full.add_argument("--max-batches-per-chat", type=int, default=20, help="Лимит батчей на чат за запуск (используется при --chat-history-pagination != off)")
     p_full.add_argument("--refresh-chat-list", action="store_true", help="Пересобрать список чатов (API + DB + journals)")
 
+    p_reprocess = sub.add_parser(
+        "reprocess-skipped-media",
+        parents=[common],
+        help="Повторно скачать и обогатить архивные history/media rows, которые раньше были импортированы в text-first режиме",
+    )
+    p_reprocess.add_argument("--batch", type=int, default=DEFAULT_MEDIA_BACKFILL_BATCH, help="Сколько архивных rows обработать за запуск")
+    p_reprocess.add_argument("--peer", type=str, default="", help="Ограничить обработку одним peer/chatId/номером")
+    p_reprocess.add_argument("--audio-only", action="store_true", help="Обрабатывать только audio/voice rows и их transcript backlog")
+
     p_run = sub.add_parser("run", parents=[common], help="Запустить polling")
     p_run.add_argument("--poll-sleep", type=float, default=DEFAULT_POLL_SLEEP, help="Пауза между циклами")
     p_run.add_argument("--max-iterations", type=int, default=0, help="0 = бесконечно")
@@ -4855,6 +5321,29 @@ def main() -> None:
             max_batches_per_chat=max(1, int(args.max_batches_per_chat)),
             refresh_chat_list=bool(args.refresh_chat_list),
             chat_history_pagination=str(args.chat_history_pagination or DEFAULT_CHAT_HISTORY_PAGINATION).strip().lower(),
+        )
+        print(json.dumps(stats, ensure_ascii=False))
+        return
+
+    if args.cmd == "reprocess-skipped-media":
+        if bool(args.no_download_media) and not bool(args.dry_run):
+            parser.error("reprocess-skipped-media must download media; remove --no-download-media")
+
+        stats = reprocess_skipped_media_once(
+            client=client,
+            db_path=args.db,
+            media_dir=args.media_dir,
+            batch=max(1, int(args.batch)),
+            dry_run=bool(args.dry_run),
+            transcribe_audio=transcribe_audio,
+            transcribe_model=str(args.transcribe_model or DEFAULT_TRANSCRIBE_MODEL),
+            transcribe_language=str(args.transcribe_language or "").strip() or None,
+            describe_images=describe_images,
+            describe_model=str(args.describe_model or DEFAULT_DESCRIBE_MODEL),
+            keep_media_files=keep_media_files,
+            no_analyze_docs=no_analyze_docs,
+            peer=str(args.peer or "").strip() or None,
+            audio_only=bool(args.audio_only),
         )
         print(json.dumps(stats, ensure_ascii=False))
         return

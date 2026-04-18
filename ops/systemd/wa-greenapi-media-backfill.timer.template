@@ -1,0 +1,12 @@
+[Unit]
+Description=Run WhatsApp historical media/audio backfill every 15 minutes
+
+[Timer]
+OnBootSec=7m
+OnUnitActiveSec=15m
+AccuracySec=1m
+Persistent=true
+Unit=wa-greenapi-media-backfill.service
+
+[Install]
+WantedBy=timers.target

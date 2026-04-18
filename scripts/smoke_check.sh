@@ -52,6 +52,9 @@ python3 "$ROOT_DIR/scripts/minitest_office_extraction.py"
 echo "[smoke] minitest: legacy .xls fallback via OpenClaw gateway"
 python3 "$ROOT_DIR/scripts/minitest_xls_fallback.py"
 
+echo "[smoke] minitest: historical skipped media/audio backfill"
+python3 "$ROOT_DIR/scripts/minitest_skipped_media_backfill.py"
+
 echo "[smoke] Пробный прием 1 уведомления в dry-run (без записи в БД / media / transcript и без deleteNotification)"
 python3 "$INGEST_SCRIPT" ingest-once --dry-run --max-events 1 --verbose
 

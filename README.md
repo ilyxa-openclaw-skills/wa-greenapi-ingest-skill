@@ -97,6 +97,22 @@ GREENAPI_TRANSCRIBE_MODEL=whisper-1
 - в `messages.text` остаётся исходный текст/caption, а если его нет — компактные media metadata;
 - в `raw_json.waArchiveIngestDiag.mediaDownload` пишется `skipped=true, reason=no_download_media_mode`.
 
+Чтобы потом дозабрать такие архивные вложения отдельным детерминированным job, используйте:
+
+```bash
+set -a && source .env && set +a
+python3 scripts/greenapi_ingest.py reprocess-skipped-media \
+  --audio-only \
+  --batch 8
+```
+
+Что делает этот второй этап:
+
+- выбирает archive rows из `greenapi-history` / `greenapi-chat-history`, где media раньше были пропущены в text-first режиме;
+- для `--audio-only` дополнительно подбирает voice/audio rows с `download_skipped` или `transcript_unavailable`;
+- повторно скачивает media и прогоняет тот же pipeline enrich/transcribe;
+- если текст row поменялся, удаляет старый embedding этой записи, чтобы `embed_missing.py` переиндексировал уже свежий transcript, а не placeholder.
+
 ## Диагностика в `raw_json.waArchiveIngestDiag`
 
 Основные блоки:
@@ -165,6 +181,7 @@ GREENAPI_OFFICE_MIN_CHARS=24
 - `python3 scripts/minitest_content_policy.py`
 - `python3 scripts/minitest_office_extraction.py`
 - `python3 scripts/minitest_xls_fallback.py`
+- `python3 scripts/minitest_skipped_media_backfill.py`
 - dry-run ingest-once
 
 ## Отдельные тесты новой политики
@@ -175,6 +192,7 @@ python3 scripts/minitest_audio_transcription_path.py
 python3 scripts/minitest_content_policy.py
 python3 scripts/minitest_office_extraction.py
 python3 scripts/minitest_xls_fallback.py
+python3 scripts/minitest_skipped_media_backfill.py
 ```
 
 Проверяет:
@@ -184,6 +202,7 @@ python3 scripts/minitest_xls_fallback.py
 - audio: default `gpt-4o-mini-transcribe` + fallback `whisper-1` + local whisper + OpenClaw capability audio
 - `.oga` WhatsApp voice notes are auto-renamed to `.ogg` for provider transcription compatibility
 - successful audio transcripts are not overwritten by later failed retries for the same `source_message_id`
+- `reprocess-skipped-media --audio-only` rebuilds archived `download_skipped` voice rows, writes fresh transcripts, and invalidates stale embeddings for those rows
 - PDF <=20 страниц: full processed
 - PDF >20 страниц: skipped (`too_many_pages`) + `pending_reprocess/manual=true`
 - text file: full analyzed
@@ -233,6 +252,18 @@ python3 scripts/greenapi_ingest.py ingest-full-history \
 
 Для строгого AUDIO_ONLY режима используйте: `--no-describe-images --no-analyze-docs`.
 Тогда будет идти только транскрибация аудио (доки/картинки пропускаются с diag reason `disabled_by_flag_no_analyze_docs`).
+
+Для второго этапа поверх text-first history используйте:
+
+```bash
+set -a && source .env && set +a
+python3 scripts/greenapi_ingest.py reprocess-skipped-media \
+  --audio-only \
+  --batch 8 \
+  --peer 77085803915@c.us
+```
+
+Это не читает live queue и не требует OpenClaw cron-обвязки: команда детерминированно переобрабатывает уже сохранённые архивные rows из локального SQLite.
 
 ### Догонять порциями (resume с checkpoint)
 
