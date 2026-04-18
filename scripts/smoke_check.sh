@@ -40,6 +40,9 @@ python3 "$ROOT_DIR/scripts/minitest_image_route_selection.py"
 echo "[smoke] minitest: audio transcription path (default model + fallback chain)"
 GREENAPI_TRANSCRIBE_MODEL=gpt-4o-mini-transcribe python3 "$ROOT_DIR/scripts/minitest_audio_transcription_path.py"
 
+echo "[smoke] minitest: successful audio transcripts are not clobbered by failed retries"
+python3 "$ROOT_DIR/scripts/minitest_transcript_no_clobber.py"
+
 echo "[smoke] minitest: content policy (PDF<=20 full, PDF>20 skip, text full)"
 python3 "$ROOT_DIR/scripts/minitest_content_policy.py"
 

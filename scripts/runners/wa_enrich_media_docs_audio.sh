@@ -11,7 +11,7 @@ cd "${WA_GREENAPI_SKILL_ROOT}"
 exec "${WA_GREENAPI_PYTHON_BIN}" "${WA_GREENAPI_SKILL_ROOT}/scripts/greenapi_ingest.py" \
   ingest-once \
   --source history \
-  --max-events "${WA_GREENAPI_ENRICH_MAX_EVENTS:-120}" \
+  --max-events "${WA_GREENAPI_ENRICH_MAX_EVENTS:-8}" \
   --chat-history-pagination off \
   --keep-media-files \
   --no-describe-images \

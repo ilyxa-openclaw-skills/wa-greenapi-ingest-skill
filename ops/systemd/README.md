@@ -38,6 +38,12 @@ systemctl status wa-greenapi-ingest-queue.timer --no-pager
 journalctl -u wa-greenapi-enrich-media.service -n 100 --no-pager
 ```
 
+Current enrich defaults:
+
+- `wa_enrich_media_docs_audio.sh` runs with `WA_GREENAPI_ENRICH_MAX_EVENTS=8` unless overridden
+- keep this job in small batches; it is deterministic, but the final audio fallback can still hit a shared provider path through `openclaw capability audio transcribe`
+- `greenapi_ingest.py` preserves an already successful audio transcript if a later retry for the same `source_message_id` fails, so timer retries cannot downgrade the archive back to `transcript_unavailable`
+
 Change schedule later:
 
 1. Edit the tracked `*.timer.template` files in this repo.

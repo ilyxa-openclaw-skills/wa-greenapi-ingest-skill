@@ -68,6 +68,8 @@
 - the final fallback runs `openclaw capability audio transcribe --file ... --json`
 - that final fallback reuses the host OpenClaw `tools.media.audio` provider order instead of requiring a separate skill-only transcription stack
 - WhatsApp voice files saved as `.oga` are normalized to `.ogg` before provider upload, because provider STT endpoints reject `.oga` even when the payload is valid Ogg/Opus
+- if a later retry fails, an already stored successful `[audio transcript] ...` row is preserved instead of being downgraded back to `transcript_unavailable`
+- the tracked systemd enrich runner defaults to `WA_GREENAPI_ENRICH_MAX_EVENTS=8` so production retries stay small and do not hammer the shared STT provider path
 
 Как переключить модель:
 
@@ -159,6 +161,7 @@ GREENAPI_OFFICE_MIN_CHARS=24
 - `python3 scripts/minitest_openclaw_image_backend.py`
 - `python3 scripts/minitest_image_route_selection.py`
 - `python3 scripts/minitest_audio_transcription_path.py`
+- `python3 scripts/minitest_transcript_no_clobber.py`
 - `python3 scripts/minitest_content_policy.py`
 - `python3 scripts/minitest_office_extraction.py`
 - `python3 scripts/minitest_xls_fallback.py`
@@ -180,6 +183,7 @@ python3 scripts/minitest_xls_fallback.py
 - конфликт результатов: приоритет `path > image_url`
 - audio: default `gpt-4o-mini-transcribe` + fallback `whisper-1` + local whisper + OpenClaw capability audio
 - `.oga` WhatsApp voice notes are auto-renamed to `.ogg` for provider transcription compatibility
+- successful audio transcripts are not overwritten by later failed retries for the same `source_message_id`
 - PDF <=20 страниц: full processed
 - PDF >20 страниц: skipped (`too_many_pages`) + `pending_reprocess/manual=true`
 - text file: full analyzed

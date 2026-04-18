@@ -2324,20 +2324,77 @@ def _discover_full_history_chat_ids(
     return merged
 
 
-def _should_replace_text(existing_text: str, incoming_text: str) -> bool:
+def _transcription_state(text: str, raw_json: str | None) -> str:
+    clean = str(text or "").strip()
+    parsed = _safe_json_loads(str(raw_json or ""))
+    diag = parsed.get("waArchiveIngestDiag") if isinstance(parsed, dict) else None
+    transcription = diag.get("transcription") if isinstance(diag, dict) else None
+    if isinstance(transcription, dict):
+        ok = transcription.get("ok")
+        if ok is True:
+            return "success"
+        if ok is False and not _is_truthy(transcription.get("skipped")):
+            return "failed"
+    if clean.startswith("[audio transcript]"):
+        return "success"
+    return "none"
+
+
+def _text_quality(text: str, raw_json: str | None = None) -> int:
+    clean = str(text or "").strip()
+    if not clean:
+        return 0
+    if _transcription_state(clean, raw_json) == "success":
+        return 4
+    if clean.startswith("<media:") and clean.endswith(">"):
+        return 1
+    if clean.startswith("[media:"):
+        return 1
+    return 3
+
+
+def _should_replace_text(
+    existing_text: str,
+    incoming_text: str,
+    existing_raw_json: str | None = None,
+    incoming_raw_json: str | None = None,
+) -> bool:
     old = str(existing_text or "").strip()
     new = str(incoming_text or "").strip()
     if not new or new == old:
         return False
 
-    old_is_placeholder = old.startswith("<media:") and old.endswith(">")
-    new_is_placeholder = new.startswith("<media:") and new.endswith(">")
-
-    if not old or old_is_placeholder:
-        return True
-    if new_is_placeholder:
+    old_transcription = _transcription_state(old, existing_raw_json)
+    new_transcription = _transcription_state(new, incoming_raw_json)
+    if old_transcription == "success" and new_transcription != "success":
         return False
+    if new_transcription == "success" and old_transcription != "success":
+        return True
+
+    old_quality = _text_quality(old, existing_raw_json)
+    new_quality = _text_quality(new, incoming_raw_json)
+    if not old or old_quality <= 1:
+        return True
+    if new_quality < old_quality:
+        return False
+    if new_quality > old_quality:
+        return True
     return len(new) >= len(old)
+
+
+def _should_preserve_existing_raw_json(
+    existing_text: str,
+    existing_raw_json: str | None,
+    incoming_text: str,
+    incoming_raw_json: str | None,
+) -> bool:
+    if not str(existing_raw_json or "").strip():
+        return False
+    old_transcription = _transcription_state(existing_text, existing_raw_json)
+    new_transcription = _transcription_state(incoming_text, incoming_raw_json)
+    if old_transcription == "success" and new_transcription != "success":
+        return True
+    return _text_quality(incoming_text, incoming_raw_json) < _text_quality(existing_text, existing_raw_json)
 
 
 def upsert_message(conn: sqlite3.Connection, row: dict[str, Any]) -> str:
@@ -2347,7 +2404,7 @@ def upsert_message(conn: sqlite3.Connection, row: dict[str, Any]) -> str:
     if source_message_id:
         existing = conn.execute(
             """
-            SELECT id, source_type, ts, direction, peer, text
+            SELECT id, source_type, ts, direction, peer, text, raw_json
             FROM messages
             WHERE source_message_id=?
             ORDER BY CASE WHEN source_type=? THEN 0 ELSE 1 END, id ASC
@@ -2356,10 +2413,15 @@ def upsert_message(conn: sqlite3.Connection, row: dict[str, Any]) -> str:
             (source_message_id, source_type),
         ).fetchone()
         if existing:
-            row_id, old_source_type, old_ts, old_direction, old_peer, old_text = existing
+            row_id, old_source_type, old_ts, old_direction, old_peer, old_text, old_raw_json = existing
 
             new_text = old_text
-            if _should_replace_text(str(old_text or ""), str(row.get("text") or "")):
+            if _should_replace_text(
+                str(old_text or ""),
+                str(row.get("text") or ""),
+                str(old_raw_json or ""),
+                str(row.get("raw_json") or ""),
+            ):
                 new_text = row.get("text")
 
             new_ts = old_ts or row.get("ts")
@@ -2369,12 +2431,21 @@ def upsert_message(conn: sqlite3.Connection, row: dict[str, Any]) -> str:
             else:
                 new_direction = old_direction
             new_peer = old_peer if str(old_peer or "").strip() not in {"", "unknown"} else row.get("peer")
+            new_raw_json = row.get("raw_json")
+            if _should_preserve_existing_raw_json(
+                str(old_text or ""),
+                str(old_raw_json or ""),
+                str(row.get("text") or ""),
+                str(row.get("raw_json") or ""),
+            ):
+                new_raw_json = old_raw_json
 
             if (
                 new_text != old_text
                 or new_ts != old_ts
                 or new_direction != old_direction
                 or new_peer != old_peer
+                or new_raw_json != old_raw_json
             ):
                 conn.execute(
                     """
@@ -2387,7 +2458,7 @@ def upsert_message(conn: sqlite3.Connection, row: dict[str, Any]) -> str:
                         new_direction,
                         new_peer,
                         new_text,
-                        row.get("raw_json"),
+                        new_raw_json,
                         row.get("source_line"),
                         source_message_id,
                         row_id,
