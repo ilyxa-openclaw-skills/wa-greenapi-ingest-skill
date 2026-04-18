@@ -67,6 +67,7 @@
 - fallback chain: `<GREENAPI_TRANSCRIBE_MODEL> -> whisper-1 -> local whisper -> OpenClaw capability audio`
 - the final fallback runs `openclaw capability audio transcribe --file ... --json`
 - that final fallback reuses the host OpenClaw `tools.media.audio` provider order instead of requiring a separate skill-only transcription stack
+- WhatsApp voice files saved as `.oga` are normalized to `.ogg` before provider upload, because provider STT endpoints reject `.oga` even when the payload is valid Ogg/Opus
 
 Как переключить модель:
 
@@ -178,6 +179,7 @@ python3 scripts/minitest_xls_fallback.py
 - image route: path-first + retry path при деградированном `image_url`
 - конфликт результатов: приоритет `path > image_url`
 - audio: default `gpt-4o-mini-transcribe` + fallback `whisper-1` + local whisper + OpenClaw capability audio
+- `.oga` WhatsApp voice notes are auto-renamed to `.ogg` for provider transcription compatibility
 - PDF <=20 страниц: full processed
 - PDF >20 страниц: skipped (`too_many_pages`) + `pending_reprocess/manual=true`
 - text file: full analyzed

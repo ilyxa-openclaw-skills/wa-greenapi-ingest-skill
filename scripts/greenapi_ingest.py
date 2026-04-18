@@ -79,6 +79,9 @@ DEFAULT_TRANSCRIBE_MODEL = (
     or "gpt-4o-mini-transcribe"
 )
 OPENAI_TRANSCRIBE_FALLBACK_MODEL = "whisper-1"
+TRANSCRIBE_EXTENSION_ALIASES = {
+    ".oga": ".ogg",
+}
 DEFAULT_TRANSCRIBE_LANGUAGE = str(os.getenv("GREENAPI_TRANSCRIBE_LANGUAGE", "")).strip() or None
 DEFAULT_OPENCLAW_AUDIO_TRANSCRIBE = str(os.getenv("GREENAPI_OPENCLAW_AUDIO_TRANSCRIBE", "1")).strip().lower() in {
     "1",
@@ -1224,6 +1227,28 @@ def transcribe_local_whisper(path: Path, language: str | None = None, timeout_se
     raise RuntimeError("no local whisper executable found")
 
 
+def _prepare_audio_transcription_input(path: Path) -> tuple[Path, Path | None]:
+    suffix = path.suffix.lower()
+    normalized_suffix = TRANSCRIBE_EXTENSION_ALIASES.get(suffix)
+    if not normalized_suffix:
+        return path, None
+
+    fd, tmp_name = tempfile.mkstemp(prefix=f"{path.stem}-", suffix=normalized_suffix)
+    os.close(fd)
+    tmp_path = Path(tmp_name)
+    shutil.copyfile(path, tmp_path)
+    return tmp_path, tmp_path
+
+
+def _cleanup_audio_transcription_input(tmp_path: Path | None) -> None:
+    if tmp_path is None:
+        return
+    try:
+        tmp_path.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
 def _build_openai_transcribe_model_chain(primary_model: str) -> list[str]:
     models: list[str] = []
 
@@ -1338,31 +1363,35 @@ def transcribe_openclaw_capability(
 
 def transcribe_with_fallback(path: Path, model: str, language: str | None) -> tuple[str, str, list[str]]:
     errs: list[str] = []
+    input_path, cleanup_path = _prepare_audio_transcription_input(path)
 
-    # Deterministic order for unattended timers: direct API first, then local,
-    # then reuse the host OpenClaw audio provider chain as the final fallback.
-    for openai_model in _build_openai_transcribe_model_chain(model):
+    try:
+        # Deterministic order for unattended timers: direct API first, then local,
+        # then reuse the host OpenClaw audio provider chain as the final fallback.
+        for openai_model in _build_openai_transcribe_model_chain(model):
+            try:
+                txt, engine = transcribe_openai(input_path, model=openai_model, language=language)
+                return txt, engine, errs
+            except Exception as e:
+                err_text = str(e)
+                errs.append(f"openai:{openai_model}: {err_text}")
+                if not _is_retryable_openai_transcribe_error(err_text):
+                    break
+
         try:
-            txt, engine = transcribe_openai(path, model=openai_model, language=language)
+            txt, engine = transcribe_local_whisper(input_path, language=language)
             return txt, engine, errs
         except Exception as e:
-            err_text = str(e)
-            errs.append(f"openai:{openai_model}: {err_text}")
-            if not _is_retryable_openai_transcribe_error(err_text):
-                break
+            errs.append(f"local: {e}")
 
-    try:
-        txt, engine = transcribe_local_whisper(path, language=language)
-        return txt, engine, errs
-    except Exception as e:
-        errs.append(f"local: {e}")
-
-    try:
-        txt, engine = transcribe_openclaw_capability(path, language=language)
-        return txt, engine, errs
-    except Exception as e:
-        errs.append(f"{OPENCLAW_AUDIO_TRANSCRIBE_ENGINE}: {e}")
-        raise RuntimeError(" | ".join(errs))
+        try:
+            txt, engine = transcribe_openclaw_capability(input_path, language=language)
+            return txt, engine, errs
+        except Exception as e:
+            errs.append(f"{OPENCLAW_AUDIO_TRANSCRIBE_ENGINE}: {e}")
+            raise RuntimeError(" | ".join(errs))
+    finally:
+        _cleanup_audio_transcription_input(cleanup_path)
 
 
 def _build_media_meta_text(meta: dict[str, Any], suffix: str = "") -> str:

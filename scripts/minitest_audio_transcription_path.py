@@ -58,6 +58,24 @@ def _run_case(
     return {"text": text, "engine": engine, "errs": errs, "calls": calls}
 
 
+def _case_oga_alias_normalization(ingest, tmp_dir: Path) -> dict:
+    source = tmp_dir / "sample.oga"
+    source.write_bytes(b"OggSfake-opus-payload")
+    alias_path, cleanup_path = ingest._prepare_audio_transcription_input(source)
+    alias_exists_before = alias_path.exists()
+    alias_bytes_match = alias_path.read_bytes() == source.read_bytes()
+    ingest._cleanup_audio_transcription_input(cleanup_path)
+    alias_exists_after = alias_path.exists()
+    return {
+        "source_suffix": source.suffix,
+        "alias_suffix": alias_path.suffix,
+        "alias_exists_before": alias_exists_before,
+        "alias_exists_after": alias_exists_after,
+        "alias_bytes_match": alias_bytes_match,
+        "alias_changed": alias_path != source,
+    }
+
+
 def _case_primary_model_success(ingest, audio_path: Path) -> dict:
     return _run_case(
         ingest,
@@ -128,6 +146,7 @@ def main() -> int:
         audio_path = tmp_dir / "sample.ogg"
         _dummy_audio(audio_path)
 
+        alias_case = _case_oga_alias_normalization(ingest, tmp_dir)
         case1 = _case_primary_model_success(ingest, audio_path)
         case2 = _case_openai_model_fallback_to_whisper1(ingest, audio_path)
         case3 = _case_openai_exhausted_then_local(ingest, audio_path)
@@ -135,6 +154,14 @@ def main() -> int:
 
     checks = {
         "default_model_is_upgraded": ingest.DEFAULT_TRANSCRIBE_MODEL == "gpt-4o-mini-transcribe",
+        "oga_alias_normalized_to_ogg": (
+            alias_case["source_suffix"] == ".oga"
+            and alias_case["alias_suffix"] == ".ogg"
+            and alias_case["alias_exists_before"] is True
+            and alias_case["alias_bytes_match"] is True
+            and alias_case["alias_exists_after"] is False
+            and alias_case["alias_changed"] is True
+        ),
         "primary_model_success_short_circuit": (
             case1["calls"]["openai"] == [ingest.DEFAULT_TRANSCRIBE_MODEL]
             and case1["calls"]["local"] == 0
@@ -179,6 +206,7 @@ def main() -> int:
             {
                 "ok": ok,
                 "checks": checks,
+                "alias_case": alias_case,
                 "case1": case1,
                 "case2": case2,
                 "case3": case3,
