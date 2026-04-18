@@ -10,6 +10,8 @@ readonly UNIT_DIR="${SYSTEMD_UNIT_DIR:-/etc/systemd/system}"
 readonly UNITS=(
   "wa-greenapi-ingest-queue.timer"
   "wa-greenapi-ingest-queue.service"
+  "wa-greenapi-history-reconcile.timer"
+  "wa-greenapi-history-reconcile.service"
   "wa-greenapi-embeddings-backfill.timer"
   "wa-greenapi-embeddings-backfill.service"
   "wa-greenapi-enrich-media.timer"
@@ -18,6 +20,7 @@ readonly UNITS=(
 
 systemctl disable --now \
   wa-greenapi-ingest-queue.timer \
+  wa-greenapi-history-reconcile.timer \
   wa-greenapi-embeddings-backfill.timer \
   wa-greenapi-enrich-media.timer || true
 
@@ -27,5 +30,6 @@ done
 
 systemctl daemon-reload
 systemctl reset-failed wa-greenapi-ingest-queue.service \
+  wa-greenapi-history-reconcile.service \
   wa-greenapi-embeddings-backfill.service \
   wa-greenapi-enrich-media.service || true

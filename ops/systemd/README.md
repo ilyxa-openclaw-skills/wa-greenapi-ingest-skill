@@ -40,6 +40,7 @@ Verify:
 ```bash
 systemctl list-timers 'wa-greenapi-*'
 systemctl status wa-greenapi-ingest-queue.timer --no-pager
+journalctl -u wa-greenapi-history-reconcile.service -n 100 --no-pager
 journalctl -u wa-greenapi-enrich-media.service -n 100 --no-pager
 ```
 
@@ -49,6 +50,8 @@ Current enrich defaults:
 - keep this job in small batches; it is deterministic, but the final audio fallback can still hit a shared provider path through `openclaw capability audio transcribe`
 - `greenapi_ingest.py` preserves an already successful audio transcript if a later retry for the same `source_message_id` fails, so timer retries cannot downgrade the archive back to `transcript_unavailable`
 - `embed_missing.py` now uses short per-row commits plus `WA_EMBED_SQLITE_BUSY_TIMEOUT_MS` (default `30000`) so the embeddings timer can coexist with live ingest/enrich writers without holding the SQLite write lock across provider round-trips
+- `wa_history_reconcile.sh` runs `ingest-full-history` in small slices and refreshes the full discovered chat universe on every run, so coverage keeps catching up even for chats that never hit the live queue runner
+- the reconcile runner intentionally shares the `wa-greenapi-ingest` flock with queue ingest, so queue/live history imports do not hammer the same GreenAPI instance and SQLite DB concurrently
 
 Change schedule later:
 
@@ -60,3 +63,4 @@ Operational rule:
 
 - do not recreate OpenClaw `cron` agent-turn wrappers for these jobs
 - if OpenClaw needs to change the cadence later, it should edit these tracked templates and redeploy them
+- coverage is not healthy just because `wa-greenapi-ingest-queue.timer` is green; the periodic `wa-greenapi-history-reconcile.timer` must also stay enabled if you want automatic backfill for previously missed chats

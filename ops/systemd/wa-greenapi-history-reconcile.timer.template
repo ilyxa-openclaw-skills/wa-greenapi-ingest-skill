@@ -1,0 +1,12 @@
+[Unit]
+Description=Run WhatsApp full-history reconcile every 30 minutes
+
+[Timer]
+OnBootSec=5m
+OnUnitActiveSec=30m
+AccuracySec=1m
+Persistent=true
+Unit=wa-greenapi-history-reconcile.service
+
+[Install]
+WantedBy=timers.target

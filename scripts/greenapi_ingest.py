@@ -2324,6 +2324,27 @@ def _discover_full_history_chat_ids(
     return merged
 
 
+def _full_history_coverage_snapshot(
+    conn: sqlite3.Connection,
+    chat_order: list[str],
+    completed: set[str],
+    sample_limit: int = 10,
+) -> dict[str, Any]:
+    db_known = _db_known_chat_ids(conn)
+    db_known_set = set(db_known)
+    ordered = [str(x).strip() for x in chat_order if str(x).strip()]
+    completed_in_order = [chat_id for chat_id in ordered if chat_id in completed]
+    missing_in_db = [chat_id for chat_id in ordered if chat_id not in db_known_set]
+    return {
+        "db_known_chats": len(db_known_set),
+        "chat_order_total": len(ordered),
+        "completed_chats_total": len(completed_in_order),
+        "remaining_chats_total": max(0, len(ordered) - len(completed_in_order)),
+        "coverage_missing_chats_total": len(missing_in_db),
+        "coverage_missing_sample": missing_in_db[: max(0, int(sample_limit))],
+    }
+
+
 def _transcription_state(text: str, raw_json: str | None) -> str:
     clean = str(text or "").strip()
     parsed = _safe_json_loads(str(raw_json or ""))
@@ -3633,6 +3654,13 @@ def _empty_stats(dry_run: bool) -> dict[str, Any]:
         "chats_processed": 0,
         "chats_empty": 0,
         "chats_non_empty": 0,
+        "db_known_chats_before": 0,
+        "db_known_chats_after": 0,
+        "chat_order_total": 0,
+        "completed_chats_total": 0,
+        "remaining_chats_total": 0,
+        "coverage_missing_chats_before": 0,
+        "coverage_missing_chats_after": 0,
         "pagination_unavailable_chats": 0,
         "http_retries_total": 0,
         "http_retries_429": 0,
@@ -3979,7 +4007,7 @@ def ingest_full_history_once(
         chat_order = [str(x).strip() for x in chat_order if str(x).strip()]
 
         if refresh_chat_list or not chat_order:
-            discovered = _discover_full_history_chat_ids(client, conn=conn, max_chats=max(0, int(max_chats)))
+            discovered = _discover_full_history_chat_ids(client, conn=conn, max_chats=0)
             if discovered:
                 chat_order = discovered
                 full_state["chat_order"] = chat_order
@@ -3993,8 +4021,15 @@ def ingest_full_history_once(
             for x in (full_state.get("pagination_unavailable_chats") or [])
             if str(x).strip()
         )
+        coverage_before = _full_history_coverage_snapshot(conn, chat_order, completed)
+        result["db_known_chats_before"] = int(coverage_before["db_known_chats"])
+        result["chat_order_total"] = int(coverage_before["chat_order_total"])
+        result["completed_chats_total"] = int(coverage_before["completed_chats_total"])
+        result["remaining_chats_total"] = int(coverage_before["remaining_chats_total"])
+        result["coverage_missing_chats_before"] = int(coverage_before["coverage_missing_chats_total"])
 
         def save_checkpoint(current_idx: int, current_chat_id: str, last_cursor: str) -> None:
+            coverage_now = _full_history_coverage_snapshot(conn, chat_order, completed)
             full_state["chat_order"] = chat_order
             full_state["chat_cursors"] = cursors
             full_state["completed_chats"] = sorted(completed)
@@ -4011,6 +4046,13 @@ def ingest_full_history_once(
                 "chatsProcessed": int(result.get("chats_processed") or 0),
                 "chatsEmpty": int(result.get("chats_empty") or 0),
                 "chatsNonEmpty": int(result.get("chats_non_empty") or 0),
+                "dbKnownChats": int(coverage_now["db_known_chats"]),
+                "chatOrderTotal": int(coverage_now["chat_order_total"]),
+                "completedChatsTotal": int(coverage_now["completed_chats_total"]),
+                "remainingChatsTotal": int(coverage_now["remaining_chats_total"]),
+                "coverageMissingChatsBefore": int(coverage_before["coverage_missing_chats_total"]),
+                "coverageMissingChatsNow": int(coverage_now["coverage_missing_chats_total"]),
+                "coverageMissingSample": list(coverage_now["coverage_missing_sample"]),
                 "httpRetriesTotal": int(result.get("http_retries_total") or 0),
                 "httpRetries429": int(result.get("http_retries_429") or 0),
                 "httpRetries5xx": int(result.get("http_retries_5xx") or 0),
@@ -4023,6 +4065,8 @@ def ingest_full_history_once(
             _save_json(state_path, state)
 
         if not chat_order:
+            result["db_known_chats_after"] = int(coverage_before["db_known_chats"])
+            result["coverage_missing_chats_after"] = int(coverage_before["coverage_missing_chats_total"])
             _apply_retry_stats_delta(result, retry_before, _retry_stats_snapshot(client))
             save_checkpoint(current_idx=0, current_chat_id="", last_cursor="")
             return result
@@ -4034,6 +4078,8 @@ def ingest_full_history_once(
             start_idx += 1
 
         if start_idx >= len(chat_order):
+            result["db_known_chats_after"] = int(coverage_before["db_known_chats"])
+            result["coverage_missing_chats_after"] = int(coverage_before["coverage_missing_chats_total"])
             _apply_retry_stats_delta(result, retry_before, _retry_stats_snapshot(client))
             save_checkpoint(current_idx=max(0, len(chat_order) - 1), current_chat_id="", last_cursor="")
             return result
@@ -4200,6 +4246,12 @@ def ingest_full_history_once(
                 full_state["current_chat_index"] = min(idx + 1, len(chat_order) - 1)
 
         full_state["last_chat_ids_touched"] = processed_chat_ids
+        coverage_after = _full_history_coverage_snapshot(conn, chat_order, completed)
+        result["db_known_chats_after"] = int(coverage_after["db_known_chats"])
+        result["chat_order_total"] = int(coverage_after["chat_order_total"])
+        result["completed_chats_total"] = int(coverage_after["completed_chats_total"])
+        result["remaining_chats_total"] = int(coverage_after["remaining_chats_total"])
+        result["coverage_missing_chats_after"] = int(coverage_after["coverage_missing_chats_total"])
         _apply_retry_stats_delta(result, retry_before, _retry_stats_snapshot(client))
         save_checkpoint(
             current_idx=int(full_state.get("current_chat_index") or start_idx),

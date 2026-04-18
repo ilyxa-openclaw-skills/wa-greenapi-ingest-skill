@@ -13,6 +13,8 @@ readonly GATEWAY_ENV_FILE="${WA_GREENAPI_GATEWAY_ENV_FILE:-/etc/openclaw/opencla
 readonly TEMPLATES=(
   "wa-greenapi-ingest-queue.service.template"
   "wa-greenapi-ingest-queue.timer.template"
+  "wa-greenapi-history-reconcile.service.template"
+  "wa-greenapi-history-reconcile.timer.template"
   "wa-greenapi-embeddings-backfill.service.template"
   "wa-greenapi-embeddings-backfill.timer.template"
   "wa-greenapi-enrich-media.service.template"
@@ -20,6 +22,7 @@ readonly TEMPLATES=(
 )
 readonly TIMERS=(
   "wa-greenapi-ingest-queue.timer"
+  "wa-greenapi-history-reconcile.timer"
   "wa-greenapi-embeddings-backfill.timer"
   "wa-greenapi-enrich-media.timer"
 )

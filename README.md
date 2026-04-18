@@ -292,6 +292,34 @@ embedding provider for the next row.
 
 Рекомендуется запускать периодически (cron/systemd timer), например раз в 2-5 минут.
 
+## Periodic full-history reconcile
+
+Queue ingest only sees fresh GREEN-API notifications. It does not backfill chats
+that were already in WhatsApp before the queue runner started or while it was
+down. For that reason the production setup should also run a periodic
+`ingest-full-history` reconcile pass.
+
+The tracked systemd runner is `scripts/runners/wa_history_reconcile.sh`. It:
+
+- refreshes the full chat universe from GREEN-API + DB + journals on every run
+- keeps the full `chat_order` in state instead of truncating discovery to the
+  current `--max-chats` slice
+- logs coverage counters such as `chat_order_total`,
+  `coverage_missing_chats_before`, and `coverage_missing_chats_after`
+- imports text/history cheaply first (`--no-download-media --no-transcribe-audio
+  --no-describe-images --no-analyze-docs`) so coverage catches up before deeper
+  enrich work
+
+Default reconcile knobs for the runner:
+
+```bash
+WA_GREENAPI_HISTORY_BATCH_SIZE=80
+WA_GREENAPI_HISTORY_MAX_CHATS_PER_RUN=120
+WA_GREENAPI_HISTORY_MAX_MESSAGES_PER_RUN=9600
+WA_GREENAPI_HISTORY_MAX_BATCHES_PER_CHAT=3
+WA_GREENAPI_HISTORY_CHAT_PAGINATION=auto
+```
+
 ## Быстрый ручной прогон (1 image + 1 voice)
 
 ```bash
