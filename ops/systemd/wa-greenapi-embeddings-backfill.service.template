@@ -9,7 +9,8 @@ Type=oneshot
 User=openclaw
 Group=openclaw
 Environment=HOME=/home/openclaw
-Environment=OPENCLAW_HOME=/home/openclaw/.openclaw
+Environment=OPENCLAW_HOME=/home/openclaw
+Environment=OPENCLAW_STATE_DIR=/home/openclaw/.openclaw
 EnvironmentFile=-__OPENCLAW_ENV_FILE__
 WorkingDirectory=__SKILL_ROOT__
 ExecStart=/bin/bash __SKILL_ROOT__/scripts/runners/wa_embeddings_backfill.sh
