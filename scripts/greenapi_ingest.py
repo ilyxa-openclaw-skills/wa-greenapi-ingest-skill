@@ -4021,6 +4021,9 @@ def ingest_full_history_once(
             for x in (full_state.get("pagination_unavailable_chats") or [])
             if str(x).strip()
         )
+        if refresh_chat_list and completed:
+            db_known_now = set(_db_known_chat_ids(conn))
+            completed = {chat_id for chat_id in completed if chat_id in db_known_now}
         coverage_before = _full_history_coverage_snapshot(conn, chat_order, completed)
         result["db_known_chats_before"] = int(coverage_before["db_known_chats"])
         result["chat_order_total"] = int(coverage_before["chat_order_total"])
@@ -4231,16 +4234,14 @@ def ingest_full_history_once(
                         }
                     break
 
-            if chat_id not in completed and batches_done >= effective_batches_limit:
-                completed.add(chat_id)
-                if pagination_enabled and processed_total < limit_messages:
-                    problematic_chats[chat_id] = {
-                        "reason": "max_batches_per_chat_reached",
-                        "cursor": cursor,
-                        "batches": int(batches_done),
-                        "batch_size": int(batch_size),
-                        "updated_at": dt.datetime.now(tz=dt.timezone.utc).isoformat(),
-                    }
+            if chat_id not in completed and batches_done >= effective_batches_limit and pagination_enabled:
+                problematic_chats[chat_id] = {
+                    "reason": "max_batches_per_chat_reached",
+                    "cursor": cursor,
+                    "batches": int(batches_done),
+                    "batch_size": int(batch_size),
+                    "updated_at": dt.datetime.now(tz=dt.timezone.utc).isoformat(),
+                }
 
             if chat_id in completed:
                 full_state["current_chat_index"] = min(idx + 1, len(chat_order) - 1)

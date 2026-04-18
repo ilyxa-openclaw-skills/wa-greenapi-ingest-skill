@@ -304,6 +304,8 @@ The tracked systemd runner is `scripts/runners/wa_history_reconcile.sh`. It:
 - refreshes the full chat universe from GREEN-API + DB + journals on every run
 - keeps the full `chat_order` in state instead of truncating discovery to the
   current `--max-chats` slice
+- reopens previously completed chats that are still missing from the local DB,
+  so an empty/transient history slice is retried on later reconcile passes
 - logs coverage counters such as `chat_order_total`,
   `coverage_missing_chats_before`, and `coverage_missing_chats_after`
 - imports text/history cheaply first (`--no-download-media --no-transcribe-audio

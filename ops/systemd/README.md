@@ -51,6 +51,7 @@ Current enrich defaults:
 - `greenapi_ingest.py` preserves an already successful audio transcript if a later retry for the same `source_message_id` fails, so timer retries cannot downgrade the archive back to `transcript_unavailable`
 - `embed_missing.py` now uses short per-row commits plus `WA_EMBED_SQLITE_BUSY_TIMEOUT_MS` (default `30000`) so the embeddings timer can coexist with live ingest/enrich writers without holding the SQLite write lock across provider round-trips
 - `wa_history_reconcile.sh` runs `ingest-full-history` in small slices and refreshes the full discovered chat universe on every run, so coverage keeps catching up even for chats that never hit the live queue runner
+- on refresh, chats that are still absent from the local DB are removed from the persisted `completed_chats` set, so previously empty/transient slices get retried on later reconcile passes
 - the reconcile runner intentionally shares the `wa-greenapi-ingest` flock with queue ingest, so queue/live history imports do not hammer the same GreenAPI instance and SQLite DB concurrently
 
 Change schedule later:
