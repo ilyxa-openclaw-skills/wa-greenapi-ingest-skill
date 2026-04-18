@@ -9,6 +9,7 @@
 .greenapi_ingest_state.json
 
 data/
+.locks/
 
 # python
 __pycache__/

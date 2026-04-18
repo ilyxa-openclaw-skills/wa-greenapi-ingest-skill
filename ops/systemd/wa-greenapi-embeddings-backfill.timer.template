@@ -1,0 +1,12 @@
+[Unit]
+Description=Run WhatsApp archive embeddings backfill every 3 minutes
+
+[Timer]
+OnBootSec=2m
+OnUnitActiveSec=3m
+AccuracySec=15s
+Persistent=true
+Unit=wa-greenapi-embeddings-backfill.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,12 @@
+[Unit]
+Description=Run WhatsApp GreenAPI queue ingest every 2 minutes
+
+[Timer]
+OnBootSec=1m
+OnUnitActiveSec=2m
+AccuracySec=15s
+Persistent=true
+Unit=wa-greenapi-ingest-queue.service
+
+[Install]
+WantedBy=timers.target
