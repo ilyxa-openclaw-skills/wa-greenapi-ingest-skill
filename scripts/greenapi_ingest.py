@@ -23,6 +23,7 @@ import mimetypes
 import os
 import random
 import re
+import shlex
 import shutil
 import sqlite3
 import subprocess
@@ -79,6 +80,25 @@ DEFAULT_TRANSCRIBE_MODEL = (
 )
 OPENAI_TRANSCRIBE_FALLBACK_MODEL = "whisper-1"
 DEFAULT_TRANSCRIBE_LANGUAGE = str(os.getenv("GREENAPI_TRANSCRIBE_LANGUAGE", "")).strip() or None
+DEFAULT_OPENCLAW_AUDIO_TRANSCRIBE = str(os.getenv("GREENAPI_OPENCLAW_AUDIO_TRANSCRIBE", "1")).strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "y",
+}
+DEFAULT_OPENCLAW_AUDIO_TRANSCRIBE_TIMEOUT = max(
+    15,
+    int(os.getenv("GREENAPI_OPENCLAW_AUDIO_TRANSCRIBE_TIMEOUT_SEC", "180")),
+)
+DEFAULT_OPENCLAW_AUDIO_TRANSCRIBE_COMMAND = (
+    str(os.getenv("GREENAPI_OPENCLAW_AUDIO_TRANSCRIBE_COMMAND", "openclaw")).strip()
+    or "openclaw"
+)
+DEFAULT_OPENCLAW_AUDIO_TRANSCRIBE_MODEL = (
+    str(os.getenv("GREENAPI_OPENCLAW_AUDIO_TRANSCRIBE_MODEL", "")).strip()
+    or None
+)
+OPENCLAW_AUDIO_TRANSCRIBE_ENGINE = "openclaw:capability-audio"
 DEFAULT_TEXT_ANALYZE_MAX_BYTES = int(os.getenv("GREENAPI_TEXT_ANALYZE_MAX_BYTES", str(8 * 1024 * 1024)))
 DEFAULT_TEXT_ANALYZE_MAX_CHARS = int(os.getenv("GREENAPI_TEXT_ANALYZE_MAX_CHARS", "2000000"))
 DEFAULT_OFFICE_MIN_CHARS = int(os.getenv("GREENAPI_OFFICE_MIN_CHARS", "24"))
@@ -1219,6 +1239,14 @@ def _build_openai_transcribe_model_chain(primary_model: str) -> list[str]:
     return models
 
 
+def _build_transcribe_backend_chain(primary_model: str) -> list[str]:
+    chain = [f"openai:{model_name}" for model_name in _build_openai_transcribe_model_chain(primary_model)]
+    chain.append("local:whisper")
+    if DEFAULT_OPENCLAW_AUDIO_TRANSCRIBE:
+        chain.append(OPENCLAW_AUDIO_TRANSCRIBE_ENGINE)
+    return chain
+
+
 def _is_retryable_openai_transcribe_error(err_text: str) -> bool:
     s = str(err_text or "").strip().lower()
     if not s:
@@ -1232,9 +1260,87 @@ def _is_retryable_openai_transcribe_error(err_text: str) -> bool:
     return not any(marker in s for marker in non_retryable_markers)
 
 
+def _build_openclaw_audio_transcribe_command(path: Path, language: str | None) -> list[str]:
+    parts = shlex.split(DEFAULT_OPENCLAW_AUDIO_TRANSCRIBE_COMMAND)
+    if not parts:
+        raise RuntimeError("GREENAPI_OPENCLAW_AUDIO_TRANSCRIBE_COMMAND is empty")
+    executable = shutil.which(parts[0])
+    if not executable:
+        raise RuntimeError(f"OpenClaw audio command is not available: {parts[0]}")
+
+    cmd = [
+        executable,
+        *parts[1:],
+        "capability",
+        "audio",
+        "transcribe",
+        "--file",
+        str(path),
+        "--json",
+    ]
+    if language:
+        cmd.extend(["--language", language])
+    if DEFAULT_OPENCLAW_AUDIO_TRANSCRIBE_MODEL:
+        cmd.extend(["--model", DEFAULT_OPENCLAW_AUDIO_TRANSCRIBE_MODEL])
+    return cmd
+
+
+def transcribe_openclaw_capability(
+    path: Path,
+    language: str | None = None,
+    timeout_sec: int = DEFAULT_OPENCLAW_AUDIO_TRANSCRIBE_TIMEOUT,
+) -> tuple[str, str]:
+    if not DEFAULT_OPENCLAW_AUDIO_TRANSCRIBE:
+        raise RuntimeError("OpenClaw audio fallback is disabled")
+
+    env = os.environ.copy()
+    env.setdefault("NO_COLOR", "1")
+    proc = subprocess.run(
+        _build_openclaw_audio_transcribe_command(path, language=language),
+        capture_output=True,
+        text=True,
+        errors="replace",
+        timeout=timeout_sec,
+        env=env,
+    )
+    if proc.returncode != 0:
+        err = (proc.stderr or proc.stdout or "").strip()
+        raise RuntimeError(f"OpenClaw capability audio failed: {err[:500]}")
+
+    raw = (proc.stdout or "").strip()
+    if not raw:
+        raise RuntimeError("OpenClaw capability audio returned empty output")
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise RuntimeError(f"OpenClaw capability audio returned invalid JSON: {e}") from e
+
+    if not isinstance(payload, dict):
+        raise RuntimeError("OpenClaw capability audio returned unexpected payload")
+    if payload.get("ok") is False:
+        raise RuntimeError(str(payload.get("error") or "OpenClaw capability audio returned ok=false"))
+
+    outputs = payload.get("outputs")
+    if not isinstance(outputs, list):
+        raise RuntimeError("OpenClaw capability audio returned no outputs array")
+
+    for item in outputs:
+        if not isinstance(item, dict):
+            continue
+        transcript = str(item.get("text") or "").strip()
+        if transcript:
+            if DEFAULT_OPENCLAW_AUDIO_TRANSCRIBE_MODEL:
+                return transcript, f"{OPENCLAW_AUDIO_TRANSCRIBE_ENGINE}:{DEFAULT_OPENCLAW_AUDIO_TRANSCRIBE_MODEL}"
+            return transcript, OPENCLAW_AUDIO_TRANSCRIBE_ENGINE
+
+    raise RuntimeError("OpenClaw capability audio returned no transcript text")
+
+
 def transcribe_with_fallback(path: Path, model: str, language: str | None) -> tuple[str, str, list[str]]:
     errs: list[str] = []
 
+    # Deterministic order for unattended timers: direct API first, then local,
+    # then reuse the host OpenClaw audio provider chain as the final fallback.
     for openai_model in _build_openai_transcribe_model_chain(model):
         try:
             txt, engine = transcribe_openai(path, model=openai_model, language=language)
@@ -1249,7 +1355,13 @@ def transcribe_with_fallback(path: Path, model: str, language: str | None) -> tu
         txt, engine = transcribe_local_whisper(path, language=language)
         return txt, engine, errs
     except Exception as e:
-        errs.append(str(e))
+        errs.append(f"local: {e}")
+
+    try:
+        txt, engine = transcribe_openclaw_capability(path, language=language)
+        return txt, engine, errs
+    except Exception as e:
+        errs.append(f"{OPENCLAW_AUDIO_TRANSCRIBE_ENGINE}: {e}")
         raise RuntimeError(" | ".join(errs))
 
 
@@ -2885,6 +2997,10 @@ def _enrich_media_and_transcript(
         "transcribeAudio": bool(transcribe_audio),
         "transcribeModel": str(transcribe_model or DEFAULT_TRANSCRIBE_MODEL),
         "transcribeOpenAiFallbackModel": OPENAI_TRANSCRIBE_FALLBACK_MODEL,
+        "transcribeFallbackChain": _build_transcribe_backend_chain(transcribe_model),
+        "openclawAudioFallbackEnabled": bool(DEFAULT_OPENCLAW_AUDIO_TRANSCRIBE),
+        "openclawAudioTranscribeCommand": DEFAULT_OPENCLAW_AUDIO_TRANSCRIBE_COMMAND,
+        "openclawAudioTranscribeModel": str(DEFAULT_OPENCLAW_AUDIO_TRANSCRIBE_MODEL or ""),
         "contentAnalyzeBackend": _normalize_image_describe_backend(DEFAULT_CONTENT_ANALYZE_BACKEND),
         "openclawGatewayUrl": DEFAULT_OPENCLAW_GATEWAY_URL,
         "textAnalyzeMaxBytes": int(DEFAULT_TEXT_ANALYZE_MAX_BYTES),
@@ -4495,7 +4611,7 @@ def main() -> None:
         default=DEFAULT_TRANSCRIBE_MODEL,
         help=(
             "OpenAI transcription model "
-            f"(default {DEFAULT_TRANSCRIBE_MODEL}; fallback {OPENAI_TRANSCRIBE_FALLBACK_MODEL} -> local whisper)"
+            f"(default {DEFAULT_TRANSCRIBE_MODEL}; fallback {OPENAI_TRANSCRIBE_FALLBACK_MODEL} -> local whisper -> OpenClaw capability audio)"
         ),
     )
     common.add_argument("--describe-model", default=DEFAULT_DESCRIBE_MODEL, help="Vision model for image description (default gpt-4o-mini)")

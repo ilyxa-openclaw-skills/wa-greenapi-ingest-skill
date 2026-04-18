@@ -64,7 +64,9 @@
 По умолчанию используется более сильная модель:
 
 - `GREENAPI_TRANSCRIBE_MODEL=gpt-4o-mini-transcribe`
-- fallback цепочка: `<GREENAPI_TRANSCRIBE_MODEL> -> whisper-1 -> local whisper`
+- fallback chain: `<GREENAPI_TRANSCRIBE_MODEL> -> whisper-1 -> local whisper -> OpenClaw capability audio`
+- the final fallback runs `openclaw capability audio transcribe --file ... --json`
+- that final fallback reuses the host OpenClaw `tools.media.audio` provider order instead of requiring a separate skill-only transcription stack
 
 Как переключить модель:
 
@@ -113,7 +115,11 @@ GREENAPI_KEEP_MEDIA_FILES=0
 GREENAPI_DESCRIBE_IMAGES=1
 GREENAPI_TRANSCRIBE_AUDIO=1
 GREENAPI_TRANSCRIBE_MODEL=gpt-4o-mini-transcribe
-# fallback: -> whisper-1 -> local whisper
+# fallback: -> whisper-1 -> local whisper -> OpenClaw capability audio
+GREENAPI_OPENCLAW_AUDIO_TRANSCRIBE=1
+GREENAPI_OPENCLAW_AUDIO_TRANSCRIBE_TIMEOUT_SEC=180
+GREENAPI_OPENCLAW_AUDIO_TRANSCRIBE_COMMAND=openclaw
+GREENAPI_OPENCLAW_AUDIO_TRANSCRIBE_MODEL=
 
 GREENAPI_CONTENT_ANALYZE_BACKEND=auto   # auto|openclaw|openai
 GREENAPI_IMAGE_DESCRIBE_BACKEND=auto    # legacy fallback var
@@ -171,7 +177,7 @@ python3 scripts/minitest_xls_fallback.py
 
 - image route: path-first + retry path при деградированном `image_url`
 - конфликт результатов: приоритет `path > image_url`
-- audio: default `gpt-4o-mini-transcribe` + fallback `whisper-1` + local whisper
+- audio: default `gpt-4o-mini-transcribe` + fallback `whisper-1` + local whisper + OpenClaw capability audio
 - PDF <=20 страниц: full processed
 - PDF >20 страниц: skipped (`too_many_pages`) + `pending_reprocess/manual=true`
 - text file: full analyzed

@@ -20,6 +20,8 @@ Credential inheritance:
 - the rendered services import `WA_GREENAPI_GATEWAY_ENV_FILE` during install
 - default: `/etc/openclaw/openclaw.env`
 - this lets the jobs reuse the same provider credentials that `openclaw.service` already has
+- the audio fallback path also reuses the host OpenClaw CLI config via `openclaw capability audio transcribe`
+- if direct `OPENAI_API_KEY` is absent, the skill can still fall through to local whisper and then to the host OpenClaw `tools.media.audio` chain
 
 Install or refresh:
 
