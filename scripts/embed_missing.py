@@ -17,6 +17,7 @@ from pathlib import Path
 DEFAULT_DB_PATH = Path(os.getenv("WA_ARCHIVE_DB_PATH", "./wa_archive.db"))
 DEFAULT_MODEL = os.getenv("WA_EMBED_MODEL", "text-embedding-3-small")
 DEFAULT_TIMEOUT_SEC = int(os.getenv("WA_EMBED_TIMEOUT_SEC", "45"))
+DEFAULT_SQLITE_BUSY_TIMEOUT_MS = int(os.getenv("WA_EMBED_SQLITE_BUSY_TIMEOUT_MS", "30000"))
 
 
 def ensure_embeddings_table(conn: sqlite3.Connection) -> None:
@@ -32,6 +33,13 @@ def ensure_embeddings_table(conn: sqlite3.Connection) -> None:
     )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_embeddings_model ON embeddings(model)")
     conn.commit()
+
+
+def connect_db(db_path: Path, busy_timeout_ms: int) -> sqlite3.Connection:
+    conn = sqlite3.connect(db_path, timeout=max(1.0, busy_timeout_ms / 1000.0))
+    conn.row_factory = sqlite3.Row
+    conn.execute(f"PRAGMA busy_timeout = {max(1000, int(busy_timeout_ms))}")
+    return conn
 
 
 def fetch_embedding(text: str, model: str, timeout_sec: int) -> list[float]:
@@ -58,9 +66,15 @@ def fetch_embedding(text: str, model: str, timeout_sec: int) -> list[float]:
     return vec
 
 
-def run_backfill(db_path: Path, batch: int, model: str, timeout_sec: int, dry_run: bool = False) -> dict[str, int]:
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
+def run_backfill(
+    db_path: Path,
+    batch: int,
+    model: str,
+    timeout_sec: int,
+    dry_run: bool = False,
+    sqlite_busy_timeout_ms: int = DEFAULT_SQLITE_BUSY_TIMEOUT_MS,
+) -> dict[str, int]:
+    conn = connect_db(db_path, sqlite_busy_timeout_ms)
     try:
         ensure_embeddings_table(conn)
 
@@ -87,14 +101,14 @@ def run_backfill(db_path: Path, batch: int, model: str, timeout_sec: int, dry_ru
                 continue
 
             vec = fetch_embedding(str(row["text"]), model=model, timeout_sec=timeout_sec)
+            # Keep the SQLite write transaction short so ingest/enrich can continue
+            # writing while we wait on the embedding provider for the next row.
             conn.execute(
                 "INSERT OR REPLACE INTO embeddings(message_id, model, vector_json) VALUES(?,?,?)",
                 (int(row["id"]), model, json.dumps(vec, ensure_ascii=False)),
             )
-            processed += 1
-
-        if not dry_run:
             conn.commit()
+            processed += 1
 
         missing_after = conn.execute(
             """
@@ -102,6 +116,8 @@ def run_backfill(db_path: Path, batch: int, model: str, timeout_sec: int, dry_ru
             FROM messages m
             LEFT JOIN embeddings e ON e.message_id = m.id
             WHERE e.message_id IS NULL
+              AND m.text IS NOT NULL
+              AND length(trim(m.text)) > 0
             """
         ).fetchone()[0]
 
@@ -120,6 +136,12 @@ def main() -> None:
     parser.add_argument("--batch", type=int, default=50, help="Max rows to embed per run")
     parser.add_argument("--model", type=str, default=DEFAULT_MODEL, help=f"Embedding model (default: {DEFAULT_MODEL})")
     parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT_SEC, help="HTTP timeout (sec)")
+    parser.add_argument(
+        "--sqlite-busy-timeout-ms",
+        type=int,
+        default=DEFAULT_SQLITE_BUSY_TIMEOUT_MS,
+        help=f"SQLite busy timeout in ms (default: {DEFAULT_SQLITE_BUSY_TIMEOUT_MS})",
+    )
     parser.add_argument("--dry-run", action="store_true", help="Only count candidates, do not call OpenAI")
     args = parser.parse_args()
 
@@ -129,6 +151,7 @@ def main() -> None:
         model=str(args.model or DEFAULT_MODEL).strip() or DEFAULT_MODEL,
         timeout_sec=max(5, int(args.timeout)),
         dry_run=bool(args.dry_run),
+        sqlite_busy_timeout_ms=max(1000, int(args.sqlite_busy_timeout_ms)),
     )
     print(json.dumps(stats, ensure_ascii=False))
 

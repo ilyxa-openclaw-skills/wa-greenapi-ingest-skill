@@ -285,6 +285,11 @@ python3 scripts/embed_missing.py --db ./wa_archive.db --batch 50 --dry-run
 python3 scripts/embed_missing.py --db ./wa_archive.db --batch 50
 ```
 
+`embed_missing.py` now commits each inserted vector immediately and honors
+`WA_EMBED_SQLITE_BUSY_TIMEOUT_MS` (or `--sqlite-busy-timeout-ms`) so the
+backfill timer does not hold the SQLite write lock while it waits on the
+embedding provider for the next row.
+
 Рекомендуется запускать периодически (cron/systemd timer), например раз в 2-5 минут.
 
 ## Быстрый ручной прогон (1 image + 1 voice)
